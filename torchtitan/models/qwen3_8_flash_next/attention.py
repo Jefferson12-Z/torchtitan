@@ -15,8 +15,10 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
+from torch.distributed._functional_collectives import all_reduce, wait_tensor
 from torch.utils.checkpoint import checkpoint
 
+from torchtitan.distributed.spmd_types import spmd_mesh_group, spmd_mesh_size
 from torchtitan.models.base.module import Module
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
@@ -81,12 +83,16 @@ class SplitLinear(Linear):
         self.projection_channels_per_group = (
             config.projection.out_features // config.num_groups
         )
+        # Split gates by their fixed per-group width, not by the projection's
+        # local group count: under TP the SPMD checker reads a passed size as
+        # global, and the local count differs from the global one.
+        self.gate_channels_per_group = config.gates.out_features // config.num_groups
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         projection_THC = self.projection(input).unflatten(
             -1, (-1, self.projection_channels_per_group)
         )
-        gates_THC = self.gates(input).unflatten(-1, (projection_THC.shape[-2], -1))
+        gates_THC = self.gates(input).unflatten(-1, (-1, self.gate_channels_per_group))
         remat.recompute_needs_tensor(projection_THC, gates_THC)
         return torch.cat((projection_THC, gates_THC), -1).flatten(-2)
 
@@ -488,7 +494,9 @@ class QSAInnerAttention(InnerAttention):
         replicating or transposing the gathered keys. On CUDA the GEMMs read bf16
         and accumulate and write fp32, exact up to summation order. They
         apply the scale and the mask: the fp32 minimum absorbs any finite
-        logit, so masked slots equal it exactly.
+        logit, so masked slots equal it exactly. Under TP each rank holds a
+        slice of the heads; their probability sums are all-reduced before max
+        pooling, since pooling each shard first changes the target.
         """
         # Pad J to a multiple of 8 with masked slots: an odd J (k * R + R - 1)
         # sends cuBLAS to an unaligned kernel about 2x slower at 125B shapes.
@@ -510,7 +518,9 @@ class QSAInnerAttention(InnerAttention):
             .unsqueeze(1)
         )
         key_indices_TJ = selected_indices_TJ.clamp_min(0)
-        teacher_blocks = []
+        num_global_heads = num_heads * spmd_mesh_size("tp")
+        num_block_tokens = num_blocks * self.compress_ratio
+        teacher_chunks = []
         for start in range(0, num_tokens, self.chunk_size):
             stop = min(start + self.chunk_size, num_tokens)
             keys_QJGK = key_THK[key_indices_TJ[start:stop]]
@@ -533,14 +543,16 @@ class QSAInnerAttention(InnerAttention):
                 else:
                     torch.baddbmm(*gemm_args, alpha=scale, out=logits_GQRJ[g])
             teacher_QJ = (
-                logits_GQRJ.softmax(-1).sum((0, 2)) / num_heads * valid_TJ[start:stop]
+                logits_GQRJ.softmax(-1).sum((0, 2))
+                / num_global_heads
+                * valid_TJ[start:stop]
             )
-            teacher_blocks.append(
-                teacher_QJ[:, : num_blocks * self.compress_ratio]
-                .unflatten(-1, (num_blocks, self.compress_ratio))
-                .amax(-1)
-            )
-        return torch.cat(teacher_blocks)
+            teacher_chunks.append(teacher_QJ[:, :num_block_tokens])
+        teacher_TJ = torch.cat(teacher_chunks)
+        tp_group = spmd_mesh_group("tp")
+        if tp_group is not None:
+            teacher_TJ = wait_tensor(all_reduce(teacher_TJ, "sum", tp_group))
+        return teacher_TJ.unflatten(-1, (num_blocks, self.compress_ratio)).amax(-1)
 
     def forward(
         self,
@@ -593,6 +605,11 @@ class QSAInnerAttention(InnerAttention):
             # Empty ranks must participate in the indexer's FSDP gradient
             # reduction; an empty sum is finite and keeps the graph edge.
             raw_sum = scores_TB.sum()
+        tp_degree = spmd_mesh_size("tp")
+        if tp_degree > 1:
+            # Indexer parameters and scores are TP-replicated. The FSDP bridge
+            # sums their local gradients, so contribute the global KL once.
+            raw_sum = raw_sum.detach() + (raw_sum - raw_sum.detach()) / tp_degree
         return self.indexer_loss.inject(
             raw_sum, carrier=output_THV, denominator=aux_loss_denominator
         )
