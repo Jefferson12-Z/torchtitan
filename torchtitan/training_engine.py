@@ -40,6 +40,7 @@ from torchtitan.distributed.accelerator_graph import (
     wrap_fwd_bwd_with_accelerator_graph,
     wrap_with_accelerator_graph,
 )
+from torchtitan.distributed.activation_offload import ActivationOffloadConfig
 from torchtitan.distributed.activation_remat import (
     ActivationRematConfig,
     DefaultActivationRematConfig,
@@ -145,6 +146,12 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         activation_remat: ActivationRematConfig | None = field(
             default_factory=DefaultActivationRematConfig
         )
+        activation_offload: ActivationOffloadConfig | None = None
+        """
+        Runtime for CPU offloading of activations retained for backward.
+        Required exactly when ``activation_remat`` offloads something
+        (``offload_block_input`` or ``offload_regions``).
+        """
         profiler: Profiler.Config = field(default_factory=Profiler.Config)
         sdc_replayer: SDCReplayer.Config | None = None
         comm: CommConfig = field(default_factory=CommConfig)
@@ -450,6 +457,28 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.model_parts = [model]
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
+
+        remat_config = config.activation_remat
+        if config.activation_offload is not None and remat_config is None:
+            raise ValueError(
+                "activation_offload requires activation_remat: the remat policy "
+                "selects what to offload."
+            )
+        if (
+            remat_config is not None
+            and remat_config.offloads_activations
+            and config.activation_offload is None
+        ):
+            raise ValueError(
+                "activation_remat offloads activations (offload_block_input or "
+                "offload_regions) but activation_offload is not set."
+            )
+        if config.activation_offload is not None and not create_seed_checkpoint:
+            assert remat_config is not None
+            # After remat and parallelization: groups wrap the final modules,
+            # and each pipeline stage gets its own offloader.
+            for model_part in self.model_parts:
+                config.activation_offload.apply(model_part, remat_config=remat_config)
 
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:

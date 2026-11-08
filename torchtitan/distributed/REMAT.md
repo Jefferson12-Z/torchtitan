@@ -77,8 +77,9 @@ The policy applies to every transformer block unless `block_overrides`
 changes it for selected blocks. A uniform policy pays the same price in every
 block: if recomputing one expensive region in two blocks is enough to fit,
 the uniform choice is to recompute it in all of them. An override names
-blocks and replaces `save_regions` and/or `recompute_regions` for them; a
-field it leaves `None` keeps the base value:
+blocks and replaces any of `save_regions`, `recompute_regions`,
+`offload_block_input` and `offload_regions` for them; a field it leaves `None`
+keeps the base value:
 
 ```python
 ActivationRematConfig(
@@ -101,7 +102,8 @@ its block to whichever stage holds it. Malformed names, empty overrides and a
 block named by two overrides raise at config time; a name the model lacks is
 not detected, since each pipeline stage holds only some blocks. Within a
 block's result, `recompute_regions` still wins over `save_regions`. The fixed
-presets reject overrides; use `ActivationRematConfig` to customize them.
+presets accept overrides that set only the offload fields; use
+`ActivationRematConfig` to change what they retain.
 
 ## Saved-tensor hooks
 
@@ -113,6 +115,13 @@ the tensor when recompute or backward needs it. Typical uses are offloading to
 CPU memory, compression, and logging. See torch_remat's
 [offloading guide](https://github.com/meta-pytorch/remat/blob/main/docs/offloading.md)
 for the full semantics.
+
+For training, TorchTitan's eager CPU offloader is driven by the remat policy
+itself: `offload_block_input` and `offload_regions` choose which retained
+tensors go to CPU instead of staying on GPU, and
+`TrainingEngine.Config.activation_offload` runs the copies, overlapped with
+compute. See [ACTIVATION_OFFLOAD.md](ACTIVATION_OFFLOAD.md). The hooks below
+are the lower-level mechanism for custom storage.
 
 To install hooks, pass a `saved_tensors_hooks` callable to
 `config.apply`. It receives each transformer block and its FQN and is

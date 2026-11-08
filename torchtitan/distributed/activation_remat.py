@@ -52,6 +52,8 @@ class BlockRematOverride:
 
     save_regions: list[str] | None = None
     recompute_regions: list[str] | None = None
+    offload_block_input: bool | None = None
+    offload_regions: list[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,12 @@ class BlockRematPolicy:
 
     save_regions: list[str]
     recompute_regions: list[str]
+    offload_block_input: bool
+    offload_regions: list[str]
+
+    @property
+    def offloads_activations(self) -> bool:
+        return self.offload_block_input or bool(self.offload_regions)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -91,6 +99,31 @@ class ActivationRematConfig:
     example, with ``save_regions=["*"]``, this lists the few regions to
     recompute, which suits starting from no remat and recomputing just enough
     to fit a memory budget.
+    """
+
+    offload_block_input: bool = False
+    """
+    Offload each transformer block's inputs that require grad (its input
+    hidden state) to CPU instead of keeping them on GPU. Under full remat
+    this is the whole stash. Inputs shared across blocks (positions, masks)
+    do not require grad and stay on GPU, as does an input sharing storage
+    with the model part's own input (e.g. a pipeline stage's input, which the
+    stage retains). Requires ``TrainingEngine.Config.activation_offload``;
+    see torchtitan/distributed/ACTIVATION_OFFLOAD.md.
+    """
+
+    offload_regions: list[str] = field(default_factory=list)
+    """
+    Glob patterns of save regions, relative to a transformer block, whose
+    retained tensors are offloaded to CPU instead of kept on GPU: the tensors
+    a region's ops save for backward and its output when recomputation reads
+    it. Only retained regions have tensors to offload, so a pattern that
+    matches only recomputed regions offloads nothing; ``["*"]`` offloads
+    everything retained. A storage is offloaded once for all its saves: a
+    save of an already-offloaded storage is offloaded whatever its region,
+    and a save of a storage another save keeps on GPU stays on GPU, since
+    offloading it would free nothing. Requires
+    ``TrainingEngine.Config.activation_offload``.
     """
 
     block_overrides: list[BlockRematOverride] = field(default_factory=list)
@@ -132,7 +165,12 @@ class ActivationRematConfig:
         for override in self.block_overrides:
             if not override.blocks:
                 raise ValueError("BlockRematOverride.blocks must not be empty.")
-            if override.save_regions is None and override.recompute_regions is None:
+            if (
+                override.save_regions is None
+                and override.recompute_regions is None
+                and override.offload_block_input is None
+                and override.offload_regions is None
+            ):
                 raise ValueError(
                     f"BlockRematOverride for {override.blocks} sets no field."
                 )
@@ -155,6 +193,8 @@ class ActivationRematConfig:
         policy = BlockRematPolicy(
             save_regions=self.save_regions,
             recompute_regions=self.recompute_regions,
+            offload_block_input=self.offload_block_input,
+            offload_regions=self.offload_regions,
         )
         for override in self.block_overrides:
             if block_fqn in override.blocks:
@@ -163,8 +203,27 @@ class ActivationRematConfig:
                     recompute_regions=_override(
                         override.recompute_regions, policy.recompute_regions
                     ),
+                    offload_block_input=_override(
+                        override.offload_block_input, policy.offload_block_input
+                    ),
+                    offload_regions=_override(
+                        override.offload_regions, policy.offload_regions
+                    ),
                 )
         return policy
+
+    @property
+    def offloads_activations(self) -> bool:
+        """Whether this policy offloads any retained tensor to CPU, in any
+        block."""
+        return (
+            self.offload_block_input
+            or bool(self.offload_regions)
+            or any(
+                override.offload_block_input or override.offload_regions
+                for override in self.block_overrides
+            )
+        )
 
     def _check_fixed_regions(
         self, save_regions: list[str], recompute_regions: list[str]
@@ -172,12 +231,17 @@ class ActivationRematConfig:
         if (
             self.save_regions != save_regions
             or self.recompute_regions != recompute_regions
-            or self.block_overrides
+            or any(
+                override.save_regions is not None
+                or override.recompute_regions is not None
+                for override in self.block_overrides
+            )
         ):
             raise ValueError(
                 f"{type(self).__name__} is a fixed policy. Use "
-                "ActivationRematConfig with explicit save_regions, "
-                "recompute_regions and block_overrides to customize it."
+                "ActivationRematConfig with explicit save_regions and "
+                "recompute_regions to customize it (offload_block_input and "
+                "offload_regions can be set on any policy, also per block)."
             )
 
     def apply(
@@ -223,7 +287,7 @@ class ActivationRematConfig:
 
         # TODO: Validate unmatched patterns once validation can account for save
         # regions across all pipeline stages instead of only this model part.
-        overridden = []
+        overridden, not_offloaded = [], []
         for layer_id, transformer_block in transformer_blocks:
             assert isinstance(transformer_block, Module)
             base_fqn = f"layers.{layer_id}"
@@ -231,6 +295,8 @@ class ActivationRematConfig:
             policy = self.block_policy(block_fqn)
             if any(block_fqn in override.blocks for override in self.block_overrides):
                 overridden.append(block_fqn)
+            if module_fqn and policy.offloads_activations:
+                not_offloaded.append(block_fqn)
             transformer_block.configure_remat_regions(
                 policy.save_regions, policy.recompute_regions
             )
@@ -254,6 +320,13 @@ class ActivationRematConfig:
         )
         if overridden:
             logger.info("Block overrides apply to: %s", ", ".join(overridden))
+        if not_offloaded:
+            # The offloader hooks only the model part's own (decoder) blocks.
+            logger.warning(
+                "Activation offload does not apply to encoder blocks; these keep "
+                "their retained tensors on GPU: %s",
+                ", ".join(not_offloaded),
+            )
 
 
 @dataclass(kw_only=True, slots=True)

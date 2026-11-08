@@ -249,6 +249,17 @@ class TestActivationCheckpointing(unittest.TestCase):
             ):
                 config_factory()
 
+    def test_preset_policies_accept_offload_overrides(self):
+        for preset in (FullActivationRematConfig, DefaultActivationRematConfig):
+            with self.subTest(preset.__name__):
+                preset(
+                    block_overrides=[
+                        BlockRematOverride(
+                            blocks=["layers.0"], offload_block_input=True
+                        )
+                    ]
+                )
+
     def test_block_overrides_replace_fields_by_original_layer_id(self):
         # PP keeps original layer ids: with blocks 81/82/91 here, "layers.1"
         # (the second block's position) must match nothing.
