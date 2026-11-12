@@ -27,6 +27,7 @@ from torchtitan_recipes.tests.models.multimodal import (
 from torchtitan_recipes.tests.models.qwen3_8_flash_next import (
     qwen38_flash_next_debugmodel,
     qwen38_flash_next_debugmodel_fsdp2_tp2_ep2,
+    qwen38_flash_next_debugmodel_fsdp2_tp2_ep4_pp2,
     qwen38_flash_next_debugmodel_mm,
 )
 
@@ -295,6 +296,16 @@ def build_b200_tests_list() -> list[IntegrationTestDefinition]:
             ),
             test_name="qwen3_8_flash_next_fsdp_tp_sp_ep",
             ngpu=4,
+            use_real_pg=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[qwen38_flash_next_debugmodel_fsdp2_tp2_ep4_pp2],
+            test_descr=(
+                "Qwen3.8-Flash-Next FSDP+TP+SP+EP+PP (Interleaved1F1B, full "
+                "remat): four-stream stage traffic and PLE on a later local part"
+            ),
+            test_name="qwen3_8_flash_next_fsdp_tp_sp_ep_pp",
+            ngpu=8,
             use_real_pg=True,
         ),
     ]
