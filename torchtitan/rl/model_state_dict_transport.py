@@ -47,6 +47,7 @@ class TensorShard(NamedTuple):
     shape: tuple[int, ...]
     """Shape of the box, i.e. of the rank's local tensor."""
     dtype: torch.dtype
+    """Dtype of the generator rank's local tensor."""
 
 
 class StagedPiece(NamedTuple):
@@ -58,18 +59,39 @@ class StagedPiece(NamedTuple):
     offset: tuple[int, ...]
     """Global offset of the piece."""
     shape: tuple[int, ...]
+    """Shape of the intersection between the trainer and generator boxes."""
+
+
+class TransferRange(NamedTuple):
+    """One contiguous byte range transferred from a trainer buffer."""
+
+    byte_offset: int
+    """Start of the range in the registered trainer buffer."""
+    nbytes: int
+    """Number of bytes in the range."""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStateDictTransferMetadata:
+    """Small control-plane metadata returned by one trainer rank's push."""
+
+    changed_ranges: tuple[TransferRange, ...]
+    """Ranges changed since the preceding delta push; empty for full sync."""
 
 
 @dataclass(frozen=True, slots=True)
 class TrainerSource:
-    """What a generator rank needs to read one trainer rank's staging buffer."""
+    """What a generator rank needs to read one trainer rank's staging buffers."""
 
     pieces: list[dict[str, StagedPiece]]
     """``pieces[rank][key]``: the staged part of generator rank ``rank``'s shard of
     ``key``, for each key this trainer rank holds part of."""
-    remote_buffer: Any
-    """The staging buffer's ``torch.distributed._transport.RemoteBuffer``."""
+    baseline_buffer: Any
+    """Primary staging buffer; the previous state when delta sync is used."""
+    current_buffer: Any
+    """Current-state buffer for delta sync; aliases ``baseline_buffer`` otherwise."""
     url: bytes
+    """Bound transport endpoint for this trainer rank."""
 
 
 class _Read(NamedTuple):
@@ -78,7 +100,9 @@ class _Read(NamedTuple):
     byte_offset: int
     """Offset in the trainer rank's staging buffer."""
     nbytes: int
+    """Number of bytes in this contiguous transfer."""
     key: str
+    """Key of the generator tensor that receives the transfer."""
     local_byte_offset: int
     """Offset in the generator's local tensor of ``key``."""
 
@@ -253,6 +277,32 @@ def _staged_pieces(
     return pieces, nbytes
 
 
+def _staged_transfer_ranges(
+    pieces: list[dict[str, StagedPiece]],
+    generator_rank_layouts: list[dict[str, TensorShard]],
+) -> tuple[TransferRange, ...]:
+    """Return the distinct direct tensor ranges staged by a trainer rank."""
+    ranges: set[TransferRange] = set()
+    for rank_pieces, layout in zip(pieces, generator_rank_layouts):
+        for key, piece in rank_pieces.items():
+            shard = layout[key]
+            dim = max(
+                (d for d, (n, m) in enumerate(zip(piece.shape, shard.shape)) if n != m),
+                default=0,
+            )
+            run_nbytes = math.prod(piece.shape[dim:]) * shard.dtype.itemsize
+            ranges.update(
+                TransferRange(piece.byte_offset + i * run_nbytes, run_nbytes)
+                for i, _ in enumerate(itertools.product(*map(range, piece.shape[:dim])))
+            )
+
+    sorted_ranges = sorted(ranges)
+    for transfer_range, next_range in itertools.pairwise(sorted_ranges):
+        if next_range.byte_offset < transfer_range.byte_offset + transfer_range.nbytes:
+            raise ValueError("staged transfer ranges overlap")
+    return tuple(sorted_ranges)
+
+
 def _check_disjoint(
     key: str, boxes: list[tuple[tuple[int, ...], tuple[int, ...]]]
 ) -> None:
@@ -350,9 +400,10 @@ class ModelStateDictTransport(Configurable):
     model state dicts.
 
     The trainer and every generator rank each build one. The trainer stages its
-    shards, cast to the generators' dtypes, in one registered pinned CPU buffer laid
-    out per generator rank; each generator rank reads its pieces from every trainer
-    rank directly into its own registered prefetch buffers.
+    shards, cast to the generators' dtypes, in registered pinned CPU buffers laid
+    out per generator rank. Full sync reads every range; delta sync reads the first
+    transfer in full and only changed ranges afterward. Each generator rank reads
+    its pieces from every trainer rank into its registered prefetch buffers.
 
     Trainer: ``register_trainer_source`` once, then ``stage`` per push.
     Generator: ``connect_generator`` once, then ``read`` per prefetch.
@@ -363,28 +414,43 @@ class ModelStateDictTransport(Configurable):
         backend: Literal["mooncake", "nixl"] = "mooncake"
         """The ``torch.distributed._transport`` backend."""
 
+        sync_mode: Literal["full", "delta"] = "full"
+        """Whether every pull reads the full state or only changed ranges."""
+
         read_timeout_s: float = 600.0
         """Seconds to wait for a generator rank's reads before raising. A pull
         moves tens of GB per generator rank at most, well under a minute at line
         rate; this fails a stuck transfer instead of hanging the controller."""
 
     def __init__(self, config: Config):
+        if config.sync_mode not in ("full", "delta"):
+            raise ValueError(f"Invalid sync mode: {config.sync_mode}")
         self._transport = new_transport(config.backend)
+        self._sync_mode = config.sync_mode
         self._read_timeout_s = config.read_timeout_s
-        # Trainer: the staging buffer and, per key in model state dict order, the
-        # dtype and placements it is staged in (None to keep its own) and a
-        # (local index, staging view) per piece.
-        self._staging: torch.Tensor | None = None
+        # Trainer: the primary and optional delta staging buffers and the fixed
+        # direct tensor ranges compared for delta sync.
+        self._baseline: torch.Tensor | None = None
+        self._current: torch.Tensor | None = None
+        self._transfer_ranges: tuple[TransferRange, ...] = ()
+        self._baseline_initialized = False
         self._staging_plan: dict[
             str,
             tuple[
                 torch.dtype,
                 tuple[Placement, ...] | None,
-                list[tuple[tuple[slice, ...], torch.Tensor]],
+                list[
+                    tuple[
+                        tuple[slice, ...],
+                        torch.Tensor,
+                        torch.Tensor,
+                    ]
+                ],
             ],
         ] = {}
-        # Generator: (local view, remote buffer) per read, or None until connected.
-        self._reads: list[tuple[Any, Any]] | None = None
+        # Generator: the registered local, baseline, and current views for each
+        # existing direct read, or None until connected.
+        self._reads: list[tuple[_Read, Any, Any, Any]] | None = None
 
     def register_trainer_source(
         self,
@@ -394,8 +460,8 @@ class ModelStateDictTransport(Configurable):
         transfer_dtype: torch.dtype | None,
         preserve_dtype_keys: frozenset[str],
     ) -> TrainerSource:
-        """Allocate and register this trainer rank's staging buffer for the generator
-        ranks' layouts, which every generator shares.
+        """Allocate and register this trainer rank's staging buffers for the
+        generator ranks' layouts, which every generator shares.
 
         Args:
             model_state_dict: This trainer rank's model state dict.
@@ -437,8 +503,19 @@ class ModelStateDictTransport(Configurable):
                 boxes[key] = _global_offset_and_local_shape(tensor, staged)
 
         pieces, nbytes = _staged_pieces(boxes, generator_rank_layouts)
-        staging = _pinned_buffer(max(nbytes, 1))
-        memory = self._transport.register_memory(staging)
+        transfer_ranges = (
+            _staged_transfer_ranges(pieces, generator_rank_layouts)
+            if self._sync_mode == "delta"
+            else ()
+        )
+        baseline = _pinned_buffer(max(nbytes, 1))
+        baseline_memory = self._transport.register_memory(baseline)
+        if self._sync_mode == "delta":
+            current = _pinned_buffer(max(nbytes, 1))
+            current_memory = self._transport.register_memory(current)
+        else:
+            current = baseline
+            current_memory = baseline_memory
         self._staging_plan = {
             key: (dtype, placements.get(key), []) for key, dtype in dtypes.items()
         }
@@ -455,8 +532,9 @@ class ModelStateDictTransport(Configurable):
                     slice(o - to, o - to + n)
                     for o, to, n in zip(piece.offset, boxes[key][0], piece.shape)
                 )
-                view = staging[start:end].view(dtype).view(piece.shape)
-                self._staging_plan[key][2].append((index, view))
+                baseline_view = baseline[start:end].view(dtype).view(piece.shape)
+                current_view = current[start:end].view(dtype).view(piece.shape)
+                self._staging_plan[key][2].append((index, baseline_view, current_view))
         # Keep restaged keys even without pieces on this rank: a redistribute is
         # a collective.
         self._staging_plan = {
@@ -464,8 +542,15 @@ class ModelStateDictTransport(Configurable):
             for key, plan in self._staging_plan.items()
             if plan[1] is not None or plan[2]
         }
-        self._staging = staging
-        return TrainerSource(pieces, memory.to_remote_buffer(), self._transport.bind())
+        self._baseline = baseline
+        self._current = current
+        self._transfer_ranges = transfer_ranges
+        return TrainerSource(
+            pieces,
+            baseline_memory.to_remote_buffer(),
+            current_memory.to_remote_buffer(),
+            self._transport.bind(),
+        )
 
     def stage(self, model_state_dict: dict[str, torch.Tensor]) -> None:
         """Cast and reshard this trainer rank's shards and copy them into the
@@ -484,8 +569,36 @@ class ModelStateDictTransport(Configurable):
                 if placements is not None:
                     tensor = tensor.redistribute(placements=placements)
                 local = _local(tensor)
-                for index, view in copies:
+                for index, baseline_view, current_view in copies:
+                    view = (
+                        current_view
+                        if self._sync_mode == "delta" and self._baseline_initialized
+                        else baseline_view
+                    )
                     view.copy_(local[index], non_blocking=True)
+
+    def finish_stage(self) -> ModelStateDictTransferMetadata:
+        """Finish staging and report ranges changed for delta sync."""
+        if self._sync_mode == "full":
+            return ModelStateDictTransferMetadata(())
+        if not self._baseline_initialized:
+            self._baseline_initialized = True
+            return ModelStateDictTransferMetadata(())
+
+        assert self._baseline is not None
+        assert self._current is not None
+        changed_ranges = []
+        with torch.no_grad():
+            for transfer_range in self._transfer_ranges:
+                start = transfer_range.byte_offset
+                end = start + transfer_range.nbytes
+                baseline = self._baseline[start:end]
+                current = self._current[start:end]
+                if torch.equal(baseline, current):
+                    continue
+                changed_ranges.append(transfer_range)
+                baseline.copy_(current)
+        return ModelStateDictTransferMetadata(tuple(changed_ranges))
 
     def connect_generator(
         self,
@@ -520,16 +633,33 @@ class ModelStateDictTransport(Configurable):
             )
             for key in {r.key for r in reads}
         }
-        self._reads = [
-            (
-                memories[r.key].to_mutable_view(r.local_byte_offset, r.nbytes),
-                sources[r.source].remote_buffer.slice(r.byte_offset, r.nbytes),
+        self._reads = []
+        for read in reads:
+            source = sources[read.source]
+            local = memories[read.key].to_mutable_view(
+                read.local_byte_offset, read.nbytes
             )
-            for r in reads
-        ]
+            self._reads.append(
+                (
+                    read,
+                    local,
+                    source.baseline_buffer.slice(read.byte_offset, read.nbytes),
+                    source.current_buffer.slice(read.byte_offset, read.nbytes),
+                )
+            )
 
-    async def read(self) -> None:
+    async def read(
+        self,
+        metadata_by_trainer_rank: tuple[ModelStateDictTransferMetadata, ...],
+        *,
+        full: bool,
+    ) -> None:
         """Fill the prefetch buffers from the trainer's staging buffers.
+
+        ``metadata_by_trainer_rank`` is returned by the same trainer ranks whose
+        ``TrainerSource`` values were passed to ``connect_generator``.
+        ``full`` is set by a generator whose prefetch buffers do not yet contain
+        a complete model state dict.
 
         A timeout leaves the transfers in flight: the prefetch buffers are
         undefined and the job must restart.
@@ -537,10 +667,25 @@ class ModelStateDictTransport(Configurable):
         assert self._reads is not None, "connect_generator must be called first"
         if not self._reads:
             return
+
+        if full or self._sync_mode == "full":
+            reads = [(local, baseline) for _, local, baseline, _ in self._reads]
+        else:
+            changed_ranges_by_source = [
+                set(metadata.changed_ranges) for metadata in metadata_by_trainer_rank
+            ]
+            reads = [
+                (local, current)
+                for read, local, _, current in self._reads
+                if TransferRange(read.byte_offset, read.nbytes)
+                in changed_ranges_by_source[read.source]
+            ]
+        if not reads:
+            return
         works = await asyncio.to_thread(
             lambda: [
                 self._transport.read(local, remote, async_op=True)
-                for local, remote in self._reads
+                for local, remote in reads
             ]
         )
         await wait_all(works, timeout=self._read_timeout_s)

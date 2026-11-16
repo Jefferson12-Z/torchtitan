@@ -10,12 +10,16 @@ one-sided RDMA reads over a `torch.distributed._transport` backend
 config.model_state_dict_transport = ModelStateDictTransport.Config(backend="nixl")
 ```
 
+This preserves full synchronization. Set `sync_mode="delta"` to transfer only
+changed ranges after the first pull.
+
 It is a separate path rather than a TorchStore transport: the trainer and
 generator shardings are known at init, so it plans every read once and stages
-straight into registered memory, with no StorageVolume, key lookup or per-step
-metadata exchange. The trainer stages a pinned CPU copy already resharded per
-generator rank, so the optimizer can step while generators read and the
-trainer keeps no persistent GPU copy.
+straight into registered memory, with no StorageVolume or key lookup. In delta
+mode, the trainer keeps the previous staged state in pinned CPU memory. The first
+push transfers it in full; later pushes compare the next staged state against
+it and transfer only changed tensor ranges. The optimizer can step while
+generators read, and the trainer keeps no persistent GPU copy.
 
 `None` keeps TorchStore, which is still needed for
 `model_state_dict_load_mode="gpu_fetch"`. TODO: delete the TorchStore path once
@@ -79,18 +83,30 @@ does not cover every element of a generator shard, or on `Partial` and uneven
 
 1. Init (`ActorSystem.initialize_model_state_dict_transport`): every generator
    reports its ranks' `shard_layout`s, which must match
-   (`shared_rank_layouts`); each trainer rank allocates and registers its
-   staging buffer (`register_trainer_source`); every generator rank registers
-   its prefetch buffers, connects to every trainer rank and plans its reads
-   (`connect_generator`).
-2. Push: the trainer casts and, where needed, restages its shards and copies
-   them into the staging buffer (`stage`). Restaging is a collective, so it
-   runs on the actor thread before the push's first `await`. The controller
-   sends the push before the next forward/backward and Monarch starts them in
-   that order, so every rank issues it before its training collectives.
-3. Pull: each generator rank issues its reads (`read`) and waits for them,
-   raising after `read_timeout_s` (600 s). A timeout leaves the reads in flight;
-   restart the job.
+   (`shared_rank_layouts`); each trainer rank allocates and registers one staging
+   tensor for full sync, or a baseline and a current-state staging tensor for
+   delta sync (`register_trainer_source`); every
+   generator rank registers its persistent prefetch buffers, connects to every
+   trainer rank and plans its reads (`connect_generator`).
+2. Push: the trainer casts and, where needed, restages its shards. Full sync
+   overwrites its one staging tensor. For delta sync, the first push fills the
+   baseline. Later pushes fill the current-state tensor, then compare its transfer
+   ranges with the baseline after the device-to-host copies finish. Changed ranges
+   are copied into the baseline for the next push.
+   Restaging is a collective, so `stage` runs on the actor thread before the
+   push's first `await`; comparison in `finish_stage` runs after stream
+   synchronization. The trainer push endpoint returns the changed ranges as
+   ordinary control-plane metadata.
+3. Pull: full sync reads the complete staging tensor on every pull. Delta sync
+   reads the baseline in full on its first pull. Later pulls consume the changed
+   ranges forwarded by the controller and read those tensor ranges directly into
+   the generators' existing pinned prefetch tensors. Each
+   generator rank waits for its reads and raises after `read_timeout_s` (600 s).
+   A timeout leaves reads and prefetch buffers undefined; restart the job.
 
-The controller finishes pull N before push N+1, so a single staging buffer is
-enough.
+The controller remains the only weight-sync coordinator and policy-version
+authority. It forwards the changed ranges without interpreting them and finishes
+pull N before push N+1, so the trainer can reuse one current-state tensor and
+generators can retain unchanged ranges from their previous prefetch state.
+Delta transfer does not add a recovery path: transfer or load failures restart
+the job, as for full transfer.

@@ -18,6 +18,7 @@ from torchtitan.config.transform import LoRATransform
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.rl.model_state_dict_transport import ModelStateDictTransferMetadata
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
@@ -166,7 +167,11 @@ def test_push_model_state_dict_stages_before_first_await() -> None:
         stream.synchronize.side_effect = lambda: sync_thread_ids.append(
             threading.get_ident()
         )
-        trainer._model_state_dict_transport = SimpleNamespace(stage=stage)
+        metadata = ModelStateDictTransferMetadata(())
+        finish_stage = MagicMock(return_value=metadata)
+        trainer._model_state_dict_transport = SimpleNamespace(
+            stage=stage, finish_stage=finish_stage
+        )
 
         # Staging must finish before the push's first await: Monarch starts the
         # next forward/backward on this rank once the push yields.
@@ -175,10 +180,11 @@ def test_push_model_state_dict_stages_before_first_await() -> None:
         assert len(staged) == 1
         assert staged[0]["weight"].data_ptr() == weight_part.weight.data_ptr()
         assert not push.done()
-        await push
+        assert await push == metadata
         # The wait for staging is off the event loop.
         assert len(sync_thread_ids) == 1
         assert sync_thread_ids[0] != main_thread_id
+        finish_stage.assert_called_once()
 
     asyncio.run(run())
 
