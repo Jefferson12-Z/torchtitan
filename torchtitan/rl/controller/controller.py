@@ -371,9 +371,8 @@ class Controller(Configurable):
         model_state_dict_transport: ModelStateDictTransport.Config | None = None
         """Moves the model state dict from the trainer into the generators with
         one-sided ``torch.distributed._transport`` reads, or None to move it through
-        TorchStore. TODO: drop None (and TorchStore) once this has rolled out and
-        covers ``gpu_fetch``. Requires ``generator.model_state_dict_load_mode="cpu_prefetch"``.
-        See ``torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md``."""
+        TorchStore. TODO: drop None (and TorchStore) once this has rolled out. See
+        ``torchtitan/rl/MODEL_STATE_DICT_TRANSPORT.md``."""
 
         # TODO: rename it to metrics_processor
         metrics: m.MetricsProcessor.Config = field(
@@ -423,16 +422,6 @@ class Controller(Configurable):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
-                )
-            # TODO: support "gpu_fetch" by reading into generator GPU memory
-            # (https://github.com/pytorch/torchtitan/issues/6070).
-            if (
-                self.model_state_dict_transport is not None
-                and self.generator.model_state_dict_load_mode != "cpu_prefetch"
-            ):
-                raise ValueError(
-                    "model_state_dict_transport requires "
-                    'generator.model_state_dict_load_mode="cpu_prefetch"'
                 )
             if (
                 self.trainer.dist_moe_runtime is not None

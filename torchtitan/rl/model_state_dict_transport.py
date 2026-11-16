@@ -16,6 +16,7 @@ import asyncio
 import itertools
 import math
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
 
@@ -77,6 +78,8 @@ class ModelStateDictTransferMetadata:
 
     changed_ranges: tuple[TransferRange, ...]
     """Ranges changed since the preceding delta push; empty for full sync."""
+    changed_keys: frozenset[str] = frozenset()
+    """Keys containing a changed range."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,9 +283,9 @@ def _staged_pieces(
 def _staged_transfer_ranges(
     pieces: list[dict[str, StagedPiece]],
     generator_rank_layouts: list[dict[str, TensorShard]],
-) -> tuple[TransferRange, ...]:
+) -> tuple[tuple[TransferRange, ...], dict[TransferRange, str]]:
     """Return the distinct direct tensor ranges staged by a trainer rank."""
-    ranges: set[TransferRange] = set()
+    range_keys = {}
     for rank_pieces, layout in zip(pieces, generator_rank_layouts):
         for key, piece in rank_pieces.items():
             shard = layout[key]
@@ -291,16 +294,18 @@ def _staged_transfer_ranges(
                 default=0,
             )
             run_nbytes = math.prod(piece.shape[dim:]) * shard.dtype.itemsize
-            ranges.update(
-                TransferRange(piece.byte_offset + i * run_nbytes, run_nbytes)
-                for i, _ in enumerate(itertools.product(*map(range, piece.shape[:dim])))
-            )
+            for i, _ in enumerate(itertools.product(*map(range, piece.shape[:dim]))):
+                transfer_range = TransferRange(
+                    piece.byte_offset + i * run_nbytes, run_nbytes
+                )
+                previous = range_keys.setdefault(transfer_range, key)
+                assert previous == key
 
-    sorted_ranges = sorted(ranges)
+    sorted_ranges = sorted(range_keys)
     for transfer_range, next_range in itertools.pairwise(sorted_ranges):
         if next_range.byte_offset < transfer_range.byte_offset + transfer_range.nbytes:
             raise ValueError("staged transfer ranges overlap")
-    return tuple(sorted_ranges)
+    return tuple(sorted_ranges), range_keys
 
 
 def _check_disjoint(
@@ -433,6 +438,7 @@ class ModelStateDictTransport(Configurable):
         self._baseline: torch.Tensor | None = None
         self._current: torch.Tensor | None = None
         self._transfer_ranges: tuple[TransferRange, ...] = ()
+        self._transfer_range_keys: dict[TransferRange, str] = {}
         self._baseline_initialized = False
         self._staging_plan: dict[
             str,
@@ -451,6 +457,8 @@ class ModelStateDictTransport(Configurable):
         # Generator: the registered local, baseline, and current views for each
         # existing direct read, or None until connected.
         self._reads: list[tuple[_Read, Any, Any, Any]] | None = None
+        self._gpu_reads: list[tuple[_Read, Any]] | None = None
+        self._gpu_keys: frozenset[str] = frozenset()
 
     def register_trainer_source(
         self,
@@ -503,11 +511,12 @@ class ModelStateDictTransport(Configurable):
                 boxes[key] = _global_offset_and_local_shape(tensor, staged)
 
         pieces, nbytes = _staged_pieces(boxes, generator_rank_layouts)
-        transfer_ranges = (
-            _staged_transfer_ranges(pieces, generator_rank_layouts)
-            if self._sync_mode == "delta"
-            else ()
-        )
+        if self._sync_mode == "delta":
+            transfer_ranges, transfer_range_keys = _staged_transfer_ranges(
+                pieces, generator_rank_layouts
+            )
+        else:
+            transfer_ranges, transfer_range_keys = (), {}
         baseline = _pinned_buffer(max(nbytes, 1))
         baseline_memory = self._transport.register_memory(baseline)
         if self._sync_mode == "delta":
@@ -545,6 +554,7 @@ class ModelStateDictTransport(Configurable):
         self._baseline = baseline
         self._current = current
         self._transfer_ranges = transfer_ranges
+        self._transfer_range_keys = transfer_range_keys
         return TrainerSource(
             pieces,
             baseline_memory.to_remote_buffer(),
@@ -588,6 +598,7 @@ class ModelStateDictTransport(Configurable):
         assert self._baseline is not None
         assert self._current is not None
         changed_ranges = []
+        changed_keys = set()
         with torch.no_grad():
             for transfer_range in self._transfer_ranges:
                 start = transfer_range.byte_offset
@@ -597,8 +608,11 @@ class ModelStateDictTransport(Configurable):
                 if torch.equal(baseline, current):
                     continue
                 changed_ranges.append(transfer_range)
+                changed_keys.add(self._transfer_range_keys[transfer_range])
                 baseline.copy_(current)
-        return ModelStateDictTransferMetadata(tuple(changed_ranges))
+        return ModelStateDictTransferMetadata(
+            tuple(changed_ranges), frozenset(changed_keys)
+        )
 
     def connect_generator(
         self,
@@ -647,6 +661,73 @@ class ModelStateDictTransport(Configurable):
                     source.current_buffer.slice(read.byte_offset, read.nbytes),
                 )
             )
+
+    def connect_generator_gpu(
+        self,
+        layout: dict[str, TensorShard],
+        *,
+        sources: list[TrainerSource],
+        rank: int,
+        generator_index: int,
+    ) -> None:
+        """Plan reads whose GPU destinations are supplied during each load."""
+        reads = _plan_reads(sources, layout, rank=rank, generator_index=generator_index)
+        for source in sources:
+            self._transport.connect(source.url)
+        self._gpu_keys = frozenset(layout)
+        self._gpu_reads = [
+            (
+                read,
+                sources[read.source].baseline_buffer.slice(
+                    read.byte_offset, read.nbytes
+                ),
+            )
+            for read in reads
+        ]
+
+    def changed_keys(
+        self,
+        metadata_by_trainer_rank: tuple[ModelStateDictTransferMetadata, ...],
+        *,
+        full: bool,
+    ) -> frozenset[str]:
+        """Return the keys to load directly into the GPU."""
+        assert self._gpu_reads is not None, "connect_generator_gpu must be called first"
+        if full or self._sync_mode == "full":
+            return self._gpu_keys
+        return self._gpu_keys.intersection(
+            key
+            for metadata in metadata_by_trainer_rank
+            for key in metadata.changed_keys
+        )
+
+    def read_into(self, state_dict: dict[str, torch.Tensor]) -> Iterable[str]:
+        """Read the latest trainer values directly into GPU tensors."""
+        assert self._gpu_reads is not None, "connect_generator_gpu must be called first"
+        tensors = {key: _local(tensor) for key, tensor in state_dict.items()}
+        if any(tensor.device.type != "cpu" for tensor in tensors.values()):
+            torch.accelerator.current_stream().synchronize()
+        memories = {}
+        registered = {}
+        try:
+            for key, tensor in tensors.items():
+                destination = (tensor.data_ptr(), tensor.nbytes, tensor.device)
+                if destination not in registered:
+                    registered[destination] = self._transport.register_memory(
+                        tensor.view(-1)
+                    )
+                memories[key] = registered[destination]
+            for read, remote in self._gpu_reads:
+                if read.key not in memories:
+                    continue
+                local = memories[read.key].to_mutable_view(
+                    read.local_byte_offset, read.nbytes
+                )
+                self._transport.read(local, remote, timeout=self._read_timeout_s)
+        finally:
+            for memory in registered.values():
+                self._transport.unregister_memory(memory)
+        return state_dict.keys()
 
     async def read(
         self,

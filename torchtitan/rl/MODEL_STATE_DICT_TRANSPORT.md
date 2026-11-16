@@ -1,7 +1,7 @@
 # Model state dict transport
 
 `ModelStateDictTransport` (`model_state_dict_transport.py`) moves the trainer's
-model state dict into the generators' prefetched model state dicts with
+model state dict into generator CPU or GPU memory with
 one-sided RDMA reads over a `torch.distributed._transport` backend
 (`backend="mooncake"`, the default, or `"nixl"`). It replaces TorchStore when
 `Controller.Config.model_state_dict_transport` is set:
@@ -21,9 +21,8 @@ push transfers it in full; later pushes compare the next staged state against
 it and transfer only changed tensor ranges. The optimizer can step while
 generators read, and the trainer keeps no persistent GPU copy.
 
-`None` keeps TorchStore, which is still needed for
-`model_state_dict_load_mode="gpu_fetch"`. TODO: delete the TorchStore path once
-this one covers `gpu_fetch`.
+`None` keeps TorchStore. TODO: delete the TorchStore path once this transport has
+rolled out.
 
 Mooncake needs `mooncake-transfer-engine-cuda13==0.3.14` (installed by
 `scripts/install_rl_env.sh`) and a PyTorch nightly from 2026-11-10 or later
@@ -86,8 +85,8 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    (`shared_rank_layouts`); each trainer rank allocates and registers one staging
    tensor for full sync, or a baseline and a current-state staging tensor for
    delta sync (`register_trainer_source`); every
-   generator rank registers its persistent prefetch buffers, connects to every
-   trainer rank and plans its reads (`connect_generator`).
+   CPU-prefetch generator rank registers its persistent prefetch buffers. A
+   GPU-fetch rank registers each temporary FSDP-group destination during loading.
 2. Push: the trainer casts and, where needed, restages its shards. Full sync
    overwrites its one staging tensor. For delta sync, the first push fills the
    baseline. Later pushes fill the current-state tensor, then compare its transfer
@@ -97,12 +96,10 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    push's first `await`; comparison in `finish_stage` runs after stream
    synchronization. The trainer push endpoint returns the changed ranges as
    ordinary control-plane metadata.
-3. Pull: full sync reads the complete staging tensor on every pull. Delta sync
-   reads the baseline in full on its first pull. Later pulls consume the changed
-   ranges forwarded by the controller and read those tensor ranges directly into
-   the generators' existing pinned prefetch tensors. Each
-   generator rank waits for its reads and raises after `read_timeout_s` (600 s).
-   A timeout leaves reads and prefetch buffers undefined; restart the job.
+3. Pull: CPU prefetch retains the existing range reads. GPU fetch uses the changed
+   keys to skip unchanged FSDP groups, reads each selected group directly into its
+   temporary GPU shards, then uses the existing FSDP all-gather and quantization.
+   Each generator rank raises after `read_timeout_s` (600 s).
 
 The controller remains the only weight-sync coordinator and policy-version
 authority. It forwards the changed ranges without interpreting them and finishes

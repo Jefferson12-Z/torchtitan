@@ -69,6 +69,7 @@ from torchtitan.rl.generator.types import (
     RequestMetricsInputs,
     SamplingConfig,
 )
+from torchtitan.rl.model_state_dict_transport import TensorShard
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,10 @@ class SGLangEngine(GenerationEngine):
     @property
     def prefetched_model_state_dict(self) -> dict[str, torch.Tensor] | None:
         return self._get_model().model_state_dict_loader.prefetched_model_state_dict
+
+    @property
+    def model_state_dict_layout(self) -> dict[str, TensorShard]:
+        return self._get_model().model_state_dict_loader.model_state_dict_layout
 
     def add_requests(
         self, requests: list[EngineRequest]
