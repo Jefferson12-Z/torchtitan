@@ -6,8 +6,12 @@
 
 import asyncio
 import logging
+import os
+import pathlib
+import sys
 from types import SimpleNamespace
 
+import cloudpickle
 import pytest
 
 from torchtitan.config import OverrideConfig
@@ -514,6 +518,47 @@ def test_stop_rollout_workers_stops_every_host_at_once_when_one_fails(caplog):
         "rollout worker mesh 0 failed to stop"
     ]
     assert system._rollout_worker_meshes == []
+
+
+class _MarkerWorker:
+    """Its `close` leaves a file: the test can't read a worker process's memory."""
+
+    def __init__(self, marker_dir: str) -> None:
+        self.marker_dir = marker_dir
+
+    async def close(self) -> None:
+        pathlib.Path(self.marker_dir, f"closed-{os.getpid()}").touch()
+
+
+class _MarkerWorkerConfig:
+    def __init__(self, marker_dir: str) -> None:
+        self.marker_dir = marker_dir
+
+    def build(self) -> _MarkerWorker:
+        return _MarkerWorker(self.marker_dir)
+
+
+def test_the_close_endpoint_reaches_each_worker_process(tmp_path):
+    async def run():
+        system = MonarchActorSystem(MonarchActorSystem.Config())
+        # The worker processes can't import this test module, so ship the fakes by value.
+        cloudpickle.register_pickle_by_value(sys.modules[__name__])
+        try:
+            workers = await system.spawn_rollout_workers(
+                _MarkerWorkerConfig(str(tmp_path)),
+                num_workers=2,
+                num_threads=1,
+                placement="controller_host_only",
+            )
+            await asyncio.gather(
+                *(host_workers.close.call() for host_workers in workers.by_host)
+            )
+            await system.stop_rollout_workers()
+        finally:
+            cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
+
+    asyncio.run(run())
+    assert len(list(tmp_path.glob("closed-*"))) == 2
 
 
 def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch):

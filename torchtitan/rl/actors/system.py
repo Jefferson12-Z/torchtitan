@@ -143,13 +143,11 @@ class ActorSystem(Configurable, abc.ABC):
         num_workers: int,
         num_threads: int,
         placement: RolloutWorkerPlacement,
-        **kwargs: Any,
     ) -> RolloutWorkersHandle:
         """Spawn ``num_workers`` rollout worker processes, spread evenly over the hosts that
         ``placement`` names (see ``RolloutWorkerPlacement``).
 
-        Each worker gets a ``num_threads``-thread pool for ``asyncio.to_thread``, and ``kwargs``
-        for its constructor.
+        Each worker gets a ``num_threads``-thread pool for ``asyncio.to_thread``.
         """
 
     @abc.abstractmethod

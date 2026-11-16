@@ -199,7 +199,6 @@ class MonarchActorSystem(ActorSystem):
         num_workers: int,
         num_threads: int,
         placement: RolloutWorkerPlacement,
-        **kwargs: Any,
     ) -> RolloutWorkersHandle:
         # ======== Pick the hosts and each host's worker count ========
         hosts = await rollout_worker_hosts(
@@ -241,7 +240,6 @@ class MonarchActorSystem(ActorSystem):
                 "rollout_worker",
                 RolloutWorkerActor,
                 worker_config=config,
-                worker_kwargs=kwargs,
                 num_threads=num_threads,
                 structured_logger_init_fn=sl.get_structured_logger_subprocess_init_fn(),
                 first_worker_index=len(by_worker),

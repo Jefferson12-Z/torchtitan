@@ -33,7 +33,7 @@ from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 from torchtitan.rl.actors.system import RolloutWorkersHandle
 from torchtitan.rl.observability import metrics as m
 
-from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
+from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import MessageEnvRolloutWorker, Rollouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 
@@ -77,7 +77,6 @@ def test_rollout_worker_actor_builds_its_worker_and_inits_its_logger(
         RolloutWorkerActor.__init__(
             actor,
             worker_config=worker_config,
-            worker_kwargs={},
             num_threads=1,
             # Bound like the controller's; the worker overrides source and rank.
             structured_logger_init_fn=functools.partial(
@@ -123,7 +122,6 @@ def test_rollout_worker_reports_its_event_loop_lag() -> None:
         RolloutWorkerActor.__init__(
             actor,
             worker_config=SimpleNamespace(build=_LoopBlockingWorker),
-            worker_kwargs={},
             num_threads=1,
             structured_logger_init_fn=None,
             first_worker_index=0,
@@ -189,8 +187,11 @@ class _WorkerActorMesh:
     def __init__(self, num_workers: int) -> None:
         self.setup_async = _CallEndpoint()
         self.sync_log_step = _CallEndpoint()
+        self.close = _CallEndpoint()
         self.workers = [_Worker() for _ in range(num_workers)]
         self.stopped = False
+        # How many times `close` ran when the workers stopped.
+        self.close_calls_at_stop: int | None = None
 
     def __len__(self) -> int:
         return len(self.workers)
@@ -203,6 +204,7 @@ class _WorkerActorMesh:
 
     async def stop(self) -> None:
         self.stopped = True
+        self.close_calls_at_stop = len(self.close.calls)
 
 
 class _WorkerMesh:
@@ -240,6 +242,8 @@ def _rollouter_without_datasets() -> Rollouter:
         worker=worker_config,
         num_threads_per_worker=2,
         worker_placement="all_hosts",
+        run_group_drain_timeout_s=30.0,
+        worker_close_timeout_s=60.0,
     )
     rollouter._workers = None
     rollouter._actor_system = None
@@ -325,7 +329,6 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
         # The actor gets the worker's own config, not the whole Rollouter config.
         assert kwargs == {
             "worker_config": rollouter._config.worker,
-            "worker_kwargs": {},
             "num_threads": 2,
             "structured_logger_init_fn": structured_logger_init_fn,
             "first_worker_index": 0,
@@ -341,7 +344,8 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
             }
         ]
         await rollouter.close()
-        assert worker_mesh.actor_mesh.stopped
+        # The workers' close ran once, before they stopped.
+        assert worker_mesh.actor_mesh.close_calls_at_stop == 1
         assert worker_mesh.stopped
 
     asyncio.run(run())
@@ -750,9 +754,9 @@ def test_close_waits_for_run_group_of_cancelled_caller(monkeypatch) -> None:
 
 def test_close_stops_waiting_after_drain_timeout(monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.setattr(rollouter_module, "_RUN_GROUP_DRAIN_TIMEOUT_S", 0.0)
         actor_mesh = _WorkerActorMesh(num_workers=1)
         rollouter = _rollouter_without_datasets()
+        rollouter._config.run_group_drain_timeout_s = 0.0
         worker_mesh = await _setup(rollouter, actor_mesh, monkeypatch)
         await _dispatch_then_cancel_caller(rollouter, actor_mesh.workers[0])
 
@@ -791,3 +795,109 @@ def test_a_run_group_that_fails_to_send_leaves_its_worker_count_unchanged(
         await rollouter.close()
 
     asyncio.run(run())
+
+
+class _HangingCallEndpoint(_CallEndpoint):
+    """Records each `.call(...)`, which then never returns."""
+
+    async def call(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+        await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize("close_ends_with", ["return", "hang"])
+def test_close_closes_the_workers_on_every_host_then_stops_them(
+    close_ends_with, caplog
+) -> None:
+    """Both hosts' workers get `close`. If both hang, `close` waits one `worker_close_timeout_s`
+    for all hosts together, not one per host, then stops the workers anyway."""
+    host_meshes = [_WorkerActorMesh(num_workers=1), _WorkerActorMesh(num_workers=1)]
+    if close_ends_with == "hang":
+        for mesh in host_meshes:
+            mesh.close = _HangingCallEndpoint()
+    stopped_after_close_calls = []
+
+    async def stop_rollout_workers() -> None:
+        stopped_after_close_calls.append(
+            [len(mesh.close.calls) for mesh in host_meshes]
+        )
+
+    async def run() -> None:
+        rollouter = _rollouter_without_datasets()
+        rollouter._config.worker_close_timeout_s = 0.05
+        rollouter._workers = RolloutWorkersHandle(by_host=host_meshes, by_worker=[])
+        rollouter._actor_system = SimpleNamespace(
+            stop_rollout_workers=stop_rollout_workers
+        )
+        await rollouter.close()
+
+    asyncio.run(run())
+    # The workers stop once, after every host's close was called.
+    assert stopped_after_close_calls == [[1, 1]]
+    # One limit for all hosts: one warning. One limit per host would warn once per host.
+    expected_warnings = 1 if close_ends_with == "hang" else 0
+    assert caplog.text.count("still closing after") == expected_warnings
+
+
+class _RaisingCallEndpoint(_CallEndpoint):
+    """Records each `.call(...)`, then raises, as a dead worker's endpoint does."""
+
+    async def call(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+        raise RuntimeError("worker died")
+
+
+class _SlowCallEndpoint(_CallEndpoint):
+    """Records each `.call(...)`, which returns after a short wait."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.finished = False
+
+    async def call(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+        await asyncio.sleep(0.05)
+        self.finished = True
+
+
+def test_one_host_failing_to_close_doesnt_cut_the_other_hosts_short(caplog) -> None:
+    dead_host = _WorkerActorMesh(num_workers=1)
+    slow_host = _WorkerActorMesh(num_workers=1)
+    dead_host.close = _RaisingCallEndpoint()
+    slow_host.close = _SlowCallEndpoint()
+    slow_host_finished_at_stop = []
+
+    async def stop_rollout_workers() -> None:
+        slow_host_finished_at_stop.append(slow_host.close.finished)
+
+    async def run() -> None:
+        rollouter = _rollouter_without_datasets()
+        rollouter._workers = RolloutWorkersHandle(
+            by_host=[dead_host, slow_host], by_worker=[]
+        )
+        rollouter._actor_system = SimpleNamespace(
+            stop_rollout_workers=stop_rollout_workers
+        )
+        await rollouter.close()
+
+    asyncio.run(run())
+    assert slow_host_finished_at_stop == [True]
+    assert "rollout workers on host 0 failed to close" in caplog.text
+
+
+def test_close_stops_the_workers_of_a_spawn_that_failed_partway() -> None:
+    """`spawn_rollout_workers` raised after starting some hosts: no handle, but those stop."""
+    stop_calls = []
+
+    async def stop_rollout_workers() -> None:
+        stop_calls.append(True)
+
+    async def run() -> None:
+        rollouter = _rollouter_without_datasets()
+        rollouter._actor_system = SimpleNamespace(
+            stop_rollout_workers=stop_rollout_workers
+        )
+        await rollouter.close()
+
+    asyncio.run(run())
+    assert stop_calls == [True]
