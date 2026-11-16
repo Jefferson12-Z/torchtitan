@@ -110,7 +110,8 @@ def rl_muse_spark_816b_a42b_slake_lora_gb300(
 
     Data: SLAKE's English closed and open questions, with the Muse Spark SLAKE SFT recipe's
     short-answer instruction. Validation: greedy answers on the English test questions
-    before the first and after the last training step.
+    before the first and after the last training step. ``slake_data_dir`` must be on every
+    host that runs rollout workers, like ``hf_assets_path`` (the Slurm launcher requires both).
     """
     max_total_tokens = 8192
     trainer_parallelism = ParallelismConfig(

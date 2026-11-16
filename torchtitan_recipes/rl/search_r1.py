@@ -71,6 +71,13 @@ from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 
 def _search_r1_rollouter_config() -> Rollouter.Config:
     return Rollouter.Config(
+        # The default `message_env.search_url` is on 127.0.0.1, so a worker on another host would
+        # get empty search results.
+        # TODO: spread these workers over all hosts, to use every host's CPUs: serve the retriever
+        #   on an address every host can reach, and set `message_env.search_url` to it. Not done
+        #   here: the user starts the retriever by hand (`torchtitan/rl/examples/search_r1/README.md`,
+        #   "Local dense retrieval server"), so the recipe can't know its address.
+        worker_placement="controller_host_only",
         training_dataloader=IterableRolloutDataLoader.Config(
             dataset=SearchR1Dataset.Config(filename="train.parquet", seed=42)
         ),

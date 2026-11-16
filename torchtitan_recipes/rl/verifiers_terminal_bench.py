@@ -106,6 +106,12 @@ def _terminal_bench_rollouter_config(
         )
 
     taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
+    # TODO: spread these rollout workers over the job's hosts, so the tasks' containers use every
+    #   host's CPUs. They stay on the controller's host through `VerifiersRollouter.Config.worker_placement`'s
+    #   default. Running each Verifiers env inside its worker (pytorch/torchtitan#6118) is not enough.
+    #   Every host also needs:
+    #   - each task's files;
+    #   - Docker, with a cap on containers per host.
     return VerifiersRollouter.Config(
         training_dataloader=IterableRolloutDataLoader.Config(
             dataset=VerifiersTaskDataset.Config(

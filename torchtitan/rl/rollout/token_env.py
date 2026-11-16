@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 def _read_image_file(path: str, image_hash: str) -> bytes:
     """Return the bytes of the image file at ``path``, which must hash to ``image_hash``.
 
+    The file must exist on the rollout worker's host. With rollout workers on several hosts,
+    keep the dataset dir in a folder every host mounts.
+
     The image-reference renderer hashes the file (`hash_image_file`) but keeps only the hash
     and the grid (the renderers library copies only ``pixel_values`` and ``image_grid_thw``
     out of `_process_image`), so `TokenEnv` reads the file again for the prompt.

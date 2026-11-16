@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from types import SimpleNamespace
 from typing import cast
@@ -20,7 +21,7 @@ pytest.importorskip("verifiers")
 
 from aiohttp import ClientSession
 
-from torchtitan.rl.actors.system import ActorSystem
+from torchtitan.rl.actors.system import ActorSystem, RolloutWorkersHandle
 from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
 from torchtitan.rl.examples.verifiers.generation_server import (
     _parse_sampling_config,
@@ -265,10 +266,13 @@ def test_setup_spawns_workers_with_the_env_server_address_and_close_stops_the_wo
 
     class _ActorSystem:
         async def spawn_rollout_workers(
-            self, config, *, num_workers, num_threads, **kwargs
+            self, config, *, num_workers, num_threads, placement, **kwargs
         ):
             events.append(("spawn", num_workers, kwargs["env_server_address"]))
-            return _WorkerActors()
+            host_workers = _WorkerActors()
+            return RolloutWorkersHandle(
+                by_host=[host_workers], by_worker=[host_workers]
+            )
 
         async def stop_rollout_workers(self) -> None:
             events.append(("stop_workers",))
@@ -285,11 +289,15 @@ def test_setup_spawns_workers_with_the_env_server_address_and_close_stops_the_wo
         generation_server=GenerationServer.Config(max_rollout_tokens=64),
     )
     rollouter = object.__new__(VerifiersRollouter)
-    rollouter._config = SimpleNamespace(worker=worker, num_threads_per_worker=3)
+    rollouter._config = SimpleNamespace(
+        worker=worker,
+        num_threads_per_worker=3,
+        worker_placement="controller_host_only",
+    )
     rollouter._verifiers_env_server = SimpleNamespace(
         start=start, close=close_env_server
     )
-    rollouter._worker_actors = None
+    rollouter._workers = None
     rollouter._actor_system = None
     rollouter._inflight_run_group_calls = set()
 
@@ -310,6 +318,18 @@ def test_setup_spawns_workers_with_the_env_server_address_and_close_stops_the_wo
         ("stop_workers",),
         ("close_env_server",),
     ]
+
+
+def test_verifiers_rollouter_rejects_spread_workers() -> None:
+    from torchtitan_recipes.rl.verifiers_dapo_math import rl_dapo_qwen3_4b_verifiers_8k
+
+    rollouter_config = rl_dapo_qwen3_4b_verifiers_8k().rollouter
+    with pytest.raises(
+        ValueError,
+        match="needs worker_placement='controller_host_only', got 'all_hosts'",
+    ):
+        # `replace` reruns `__post_init__`, where the check runs.
+        dataclasses.replace(rollouter_config, worker_placement="all_hosts")
 
 
 def test_trainable_token_spans() -> None:

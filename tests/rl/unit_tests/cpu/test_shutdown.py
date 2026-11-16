@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -472,6 +473,47 @@ def test_spawn_proc_mesh_checks_gpus_per_host_before_spawning(
         )
 
     assert all(mesh.visible_devices == [] for mesh in meshes.values())
+
+
+def test_stop_rollout_workers_stops_every_host_at_once_when_one_fails(caplog):
+    """Each stop waits until every stop has started, so stopping one host after another would
+    hang. Host 0's stop raises as soon as it is called."""
+    started: list[str] = []
+
+    class _FailingMesh:
+        def stop(self):
+            raise RuntimeError("host is gone")
+
+    class _BarrierMesh:
+        def __init__(self, name: str, all_started: asyncio.Event) -> None:
+            self.name = name
+            self.all_started = all_started
+
+        async def stop(self):
+            started.append(self.name)
+            if len(started) == 2:
+                self.all_started.set()
+            await self.all_started.wait()
+
+    async def run() -> MonarchActorSystem:
+        all_started = asyncio.Event()
+        system = MonarchActorSystem(MonarchActorSystem.Config())
+        system._rollout_worker_meshes = [
+            _FailingMesh(),
+            _BarrierMesh("host 1", all_started),
+            _BarrierMesh("host 2", all_started),
+        ]
+        await asyncio.wait_for(system.stop_rollout_workers(), timeout=5)
+        return system
+
+    with caplog.at_level(logging.ERROR, logger=monarch_system.__name__):
+        system = asyncio.run(run())
+
+    assert started == ["host 1", "host 2"]
+    assert [record.getMessage() for record in caplog.records] == [
+        "rollout worker mesh 0 failed to stop"
+    ]
+    assert system._rollout_worker_meshes == []
 
 
 def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch):

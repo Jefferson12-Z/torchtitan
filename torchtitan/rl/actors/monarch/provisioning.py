@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 """Monarch proc meshes for the RL roles: GPU meshes for the trainer and generators,
-CPU meshes on the controller host, and the Monarch client's shutdown."""
+CPU meshes on the controller host, the rollout workers' hosts, and the Monarch client's
+shutdown."""
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from monarch.actor import (
     default_bootstrap_cmd,
@@ -22,6 +24,9 @@ from monarch.actor import (
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.rl._env import apply_env_defaults
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+
+if TYPE_CHECKING:
+    from torchtitan.rl.rollout.rollouter import RolloutWorkerPlacement
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +296,59 @@ def spawn_proc_mesh(
 def spawn_cpu_procs(num_procs: int) -> ProcMesh:
     """Spawn ``num_procs`` CPU procs on the controller host."""
     return this_host().spawn_procs(per_host={"cpus": num_procs})
+
+
+async def rollout_worker_hosts(
+    *,
+    host_meshes: HostMeshes | None,
+    placement: "RolloutWorkerPlacement",
+    controller_host_indices: Callable[[list[HostMesh]], Awaitable[list[int]]],
+) -> list[HostMesh]:
+    """Return the hosts to spread the rollout workers over, one single-host mesh each.
+
+    "all_hosts" puts the controller's host last (see `RolloutWorkerPlacement`).
+    "controller_host_only" returns `[this_host()]`: the controller's machine, even when it runs
+    outside the job.
+
+    Args:
+        host_meshes: The launcher's hosts. None without a launcher: then the job is this host
+            alone, which runs the controller.
+        placement: `Rollouter.Config.worker_placement`.
+        controller_host_indices: Returns the indices of the job hosts that run the controller,
+            e.g. `MonarchActorSystem.controller_host_indices`.
+    """
+    if placement == "controller_host_only":
+        return [this_host()]
+
+    # ======== Find the controller's hosts and the others ========
+    if host_meshes is None:
+        controller_hosts, other_hosts = [this_host()], []
+    else:
+        # Each mesh once: roles that share a host share its mesh object.
+        # Keyed by id(mesh) because a HostMesh can't be a dict key.
+        meshes = {
+            id(mesh): mesh for mesh in (host_meshes.trainer, *host_meshes.generators)
+        }
+        # One single-host mesh per job host. `flatten("hosts")` gives each mesh one "hosts" axis to
+        # slice: a launcher's mesh already has it, but a `this_host()` mesh has no axis.
+        hosts = [
+            mesh.flatten("hosts").slice(hosts=i)
+            for mesh in meshes.values()
+            for i in range(len(mesh))
+        ]
+        indices = await controller_host_indices(hosts)
+        controller_hosts = [hosts[i] for i in indices]
+        other_hosts = [host for i, host in enumerate(hosts) if i not in indices]
+
+    # ======== Order the hosts by placement ========
+    if placement == "all_hosts":
+        return other_hosts + controller_hosts
+    if not other_hosts:
+        raise ValueError(
+            "rollouter.worker_placement='all_but_controller_host' leaves no host: every host of this "
+            "job is the controller's machine. Please use 'all_hosts', or add hosts to the job."
+        )
+    return other_hosts
 
 
 def shutdown() -> None:

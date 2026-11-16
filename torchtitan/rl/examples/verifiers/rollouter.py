@@ -35,7 +35,11 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.rollout.data import IterableRolloutDataLoader
-from torchtitan.rl.rollout.rollouter import BaseRolloutWorker, Rollouter
+from torchtitan.rl.rollout.rollouter import (
+    BaseRolloutWorker,
+    Rollouter,
+    RolloutWorkerPlacement,
+)
 from torchtitan.rl.rollout.rubric import RewardFn
 from torchtitan.rl.rollout.types import (
     GenerateFn,
@@ -101,6 +105,10 @@ class VerifiersRollouter(Rollouter):
         verifiers_env_server: VerifiersEnvServer.Config
         """Environment server spawned and owned by this rollouter."""
 
+        worker_placement: RolloutWorkerPlacement = "controller_host_only"
+        """Must stay "controller_host_only": the env server runs on the controller's host (see
+        `__post_init__`)."""
+
         def __post_init__(self) -> None:
             Rollouter.Config.__post_init__(self)
             # The user sets the taskset once, in the training dataset; the env server's comes from it.
@@ -125,6 +133,17 @@ class VerifiersRollouter(Rollouter):
                     self.training_dataloader.dataset.verifiers_taskset
                 ),
             )
+            # TODO: let these workers run on every job host, so they use all the job's CPUs, once
+            #   each worker runs its own Verifiers env (pytorch/torchtitan#6118). Then drop this check
+            #   and the "controller_host_only" default. The Terminal-Bench recipes then set
+            #   `worker_placement="controller_host_only"` themselves, because each task's files come
+            #   from the controller host's Harbor cache and Docker runs there.
+            if self.worker_placement != "controller_host_only":
+                raise ValueError(
+                    "VerifiersRollouter needs worker_placement='controller_host_only', got "
+                    f"{self.worker_placement!r}. The env server and each worker's generation server "
+                    "listen on 127.0.0.1, so every worker must run on the env server's host."
+                )
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)

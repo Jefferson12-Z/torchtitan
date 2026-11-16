@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import random
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import numpy as np
 
@@ -39,7 +40,7 @@ from torchtitan.rl.rollout.types import (
 if TYPE_CHECKING:
     from renderers import Renderer
 
-    from torchtitan.rl.actors.system import ActorSystem
+    from torchtitan.rl.actors.system import ActorSystem, RolloutWorkersHandle
 
     # Type-only: importing the generator module here would pull in vLLM at import time.
     from torchtitan.rl.generator.types import SamplingConfig
@@ -50,6 +51,21 @@ logger = logging.getLogger(__name__)
 # How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway.
 # Drains took under 0.3 s once the generators closed; 30 s only covers a group stuck in a slow env step.
 _RUN_GROUP_DRAIN_TIMEOUT_S = 30.0
+
+# The hosts the rollout workers spread over, evenly:
+#   "all_hosts": every job host, the controller's host last (it gets an extra worker only after
+#     every other host has one).
+#   "all_but_controller_host": every job host but the controller's, e.g. when that host is short of
+#     memory or CPU. Setup raises when the job has no other host.
+#   "controller_host_only": the controller's host, for an env that needs a service at 127.0.0.1,
+#     files at a local path, or a local Docker daemon.
+# Example: 5 workers, trainer hosts t0 and t1, generator hosts g0 and g1, the controller on t1:
+#   "all_hosts"                 t0: 2, g0: 1, g1: 1, t1: 1
+#   "all_but_controller_host"   t0: 2, g0: 2, g1: 1
+#   "controller_host_only"      t1: 5
+RolloutWorkerPlacement = Literal[
+    "all_hosts", "all_but_controller_host", "controller_host_only"
+]
 
 
 class Rollouter(Configurable):
@@ -122,6 +138,9 @@ class Rollouter(Configurable):
         """Size of each worker process's default thread pool executor, i.e. the pool
         behind every `asyncio.to_thread` call in that process."""
 
+        worker_placement: RolloutWorkerPlacement = "all_hosts"
+        """The hosts the rollout workers spread over. See `RolloutWorkerPlacement`."""
+
         def __post_init__(self) -> None:
             if self.num_threads_per_worker < 1:
                 raise ValueError(
@@ -136,8 +155,8 @@ class Rollouter(Configurable):
             raise ValueError("training_dataloader must build a RolloutDataLoader")
         self._training_dataloader = iter(training_dataloader)
 
-        # The worker pool's actor handle and the actor system that spawned it.
-        self._worker_actors: Any | None = None
+        # The rollout workers' handles and the actor system that spawned them.
+        self._workers: RolloutWorkersHandle | None = None
         self._actor_system: ActorSystem | None = None
         # `run_group` calls still running on a worker, including those whose caller was cancelled.
         self._inflight_run_group_calls: set[asyncio.Future[RolloutGroup]] = set()
@@ -176,21 +195,27 @@ class Rollouter(Configurable):
         worker_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Spawn `num_workers` rollout workers through `actor_system` and initialize them."""
-        if self._worker_actors is not None:
+        if self._workers is not None:
             raise RuntimeError("rollout worker pool is already initialized")
 
         self._actor_system = actor_system
-        self._worker_actors = await actor_system.spawn_rollout_workers(
+        self._workers = await actor_system.spawn_rollout_workers(
             self._config.worker,
             num_workers=num_workers,
             num_threads=self._config.num_threads_per_worker,
+            placement=self._config.worker_placement,
             **(worker_kwargs or {}),
         )
-        await self._worker_actors.setup_async.call(
-            tokenizer_config=tokenizer_config,
-            renderer_config=renderer_config,
-            hf_assets_path=hf_assets_path,
-            vision_processor_config=vision_processor_config,
+        await asyncio.gather(
+            *(
+                host_workers.setup_async.call(
+                    tokenizer_config=tokenizer_config,
+                    renderer_config=renderer_config,
+                    hf_assets_path=hf_assets_path,
+                    vision_processor_config=vision_processor_config,
+                )
+                for host_workers in self._workers.by_host
+            )
         )
 
     async def close(self) -> None:
@@ -205,7 +230,7 @@ class Rollouter(Configurable):
         Monarch fails that actor and the finished job exits 130.
         """
         actor_system = self._actor_system
-        self._worker_actors = None
+        self._workers = None
         self._actor_system = None
         calls = tuple(self._inflight_run_group_calls)
         if calls:
@@ -224,8 +249,13 @@ class Rollouter(Configurable):
 
     async def sync_log_step(self, step: int) -> None:
         """Propagate the controller log step to every rollout worker."""
-        if self._worker_actors is not None:
-            await self._worker_actors.sync_log_step.call(step)
+        if self._workers is not None:
+            await asyncio.gather(
+                *(
+                    host_workers.sync_log_step.call(step=step)
+                    for host_workers in self._workers.by_host
+                )
+            )
 
     async def run_group_rollouts(
         self,
@@ -251,13 +281,12 @@ class Rollouter(Configurable):
         Returns:
             One scored `RolloutGroup`.
         """
-        if self._worker_actors is None:
+        if self._workers is None:
             raise RuntimeError("rollout worker pool is not initialized")
 
-        # `choose` (see ActorSystem's call convention) sends the call to the `run_group`
-        # endpoint of one worker in the pool.
+        # A worker picked uniformly at random, as Monarch's `choose` does on one mesh.
         call = asyncio.ensure_future(
-            self._worker_actors.run_group.choose(
+            random.choice(self._workers.by_worker).run_group.call_one(
                 generate_fn=generate_fn,
                 release_session_fn=release_session_fn,
                 sample=sample,
