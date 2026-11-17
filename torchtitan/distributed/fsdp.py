@@ -22,7 +22,11 @@ from torch.distributed.tensor import Shard
 
 from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import FlexShardConfig, FSDP2Config, FSDPSymmMemScope
-from torchtitan.distributed.flex_shard_fsdp import record_grad_norm_mesh
+from torchtitan.distributed.flex_shard_fsdp import (
+    record_buckets,
+    record_grad_norm_mesh,
+    reshard_flex_shard,
+)
 from torchtitan.distributed.fsdp_lifecycle import complete_fsdp_grouped_forward
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
@@ -52,9 +56,11 @@ def post_validate_fsdp_for_accelerator_graph(model_parts: list[nn.Module]) -> No
     Eager and captured validation use the same cleanup. With ChunkedLossWrapper,
     the model skips lm_head, then the loss calls it after the root forward.
     A group containing norm and lm_head can still have norm pending. Validation
-    has no backward callback to clear this state.
+    has no backward callback to clear this state. With FlexShard, ``reshard()``
+    closes the same forward of norm and lm_head's bucket.
     """
     for model in model_parts:
+        reshard_flex_shard(model)
         for module in model.modules():
             if not isinstance(module, FSDPModule):
                 continue
@@ -628,19 +634,29 @@ def _apply_flex_shard(
                     init_from_full, layout=layout, init_fn=module._param_init[name]
                 ),
             }
+    # Every bucket holds parameters, so there is one storage per bucket.
+    assert len(flex_shard_module.sharded_bucket_storages) == len(buckets)
+    storages = iter(flex_shard_module.sharded_bucket_storages)
+    group_storages = {}
+    for group, specs in zip(groups, group_buckets):
+        storages_of_group = [next(storages) for _ in specs]
+        group_storages.update(dict.fromkeys(group.modules, storages_of_group))
+        # FSDP2 unshards a block's expert group with the block, so the
+        # expert bucket prefetches nothing itself.
+        for storage in storages_of_group[1:]:
+            storage.set_buckets_to_forward_prefetch([])
+            storage.set_buckets_to_backward_prefetch([])
+    # ChunkedLossWrapper calls lm_head on its own, and fsdp_partial_backwards
+    # then needs its bucket.
+    record_buckets(
+        model,
+        {
+            module: storages_of_module[0]
+            for module, storages_of_module in group_storages.items()
+            if len(storages_of_module) == 1
+        },
+    )
     if expert_mesh is not None:
-        # Every bucket holds parameters, so there is one storage per bucket.
-        assert len(flex_shard_module.sharded_bucket_storages) == len(buckets)
-        storages = iter(flex_shard_module.sharded_bucket_storages)
-        group_storages = {}
-        for group, specs in zip(groups, group_buckets):
-            storages_of_group = [next(storages) for _ in specs]
-            group_storages.update(dict.fromkeys(group.modules, storages_of_group))
-            # FSDP2 unshards a block's expert group with the block, so the
-            # expert bucket prefetches nothing itself.
-            for storage in storages_of_group[1:]:
-                storage.set_buckets_to_forward_prefetch([])
-                storage.set_buckets_to_backward_prefetch([])
         # FlexShard's default prefetches the next bucket in forward order. A
         # block's expert bucket would then gather the next block's dense bucket
         # before EP's device-to-host sync, but the next block's expert bucket

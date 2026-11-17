@@ -28,17 +28,22 @@ memory and communication. FSDP2 skips the embedding's backward all-gather
 embedding again in backward, with the same values. And an MoE block's expert
 bucket hooks the routed experts, not the block, so FlexShard reshards them as
 soon as the routed experts finish forward or backward, while FSDP2 keeps the
-block's expert group unsharded until the whole block finishes. FlexShard is
-imported only when it is selected.
+block's expert group unsharded until the whole block finishes.
+``flex_shard_partial_backwards`` keeps ``lm_head``'s bucket unsharded across
+``ChunkedLossWrapper``'s chunks, as ``fsdp_partial_backwards`` keeps FSDP2's
+group. FlexShard is imported only when it is selected.
 """
 
 import math
 import weakref
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 if TYPE_CHECKING:
@@ -47,7 +52,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "flex_shard_grad_norm",
+    "flex_shard_partial_backwards",
+    "has_flex_shard_bucket",
+    "record_buckets",
     "record_grad_norm_mesh",
+    "reshard_flex_shard",
     "validate_flex_shard_training",
 ]
 
@@ -56,6 +65,15 @@ __all__ = [
 # mesh the buckets hold, which keeps the entry alive as long as the model.
 _GRAD_NORM_MESHES: weakref.WeakKeyDictionary[
     DeviceMesh, DeviceMesh
+] = weakref.WeakKeyDictionary()
+
+# For flex_shard_partial_backwards and reshard_flex_shard: the models FlexShard
+# sharded, and the bucket of each module whose FSDP2 group is one bucket, e.g.
+# lm_head's, which also holds the final norm. A bucket holds its model, which
+# holds the module, so the bucket is referenced weakly to let the entry go.
+_FLEX_SHARD_MODELS: weakref.WeakSet[nn.Module] = weakref.WeakSet()
+_MODULE_BUCKETS: weakref.WeakKeyDictionary[
+    nn.Module, weakref.ref[Any]
 ] = weakref.WeakKeyDictionary()
 
 
@@ -113,6 +131,76 @@ def flex_shard_grad_norm(
     return total_norm
 
 
+def record_buckets(model: nn.Module, module_buckets: dict[nn.Module, Any]) -> None:
+    """Record that FlexShard sharded ``model``, and the bucket storage of each
+    module in ``module_buckets``, for ``flex_shard_partial_backwards`` and
+    ``reshard_flex_shard``. Call it after ``flex_shard(model)``."""
+    _FLEX_SHARD_MODELS.add(model)
+    for module, bucket in module_buckets.items():
+        _MODULE_BUCKETS[module] = weakref.ref(bucket)
+
+
+def has_flex_shard_bucket(module: nn.Module) -> bool:
+    """Whether FlexShard sharded ``module``'s FSDP2 group as one bucket, as it
+    does ``lm_head``'s, for ``flex_shard_partial_backwards``."""
+    return module in _MODULE_BUCKETS
+
+
+@contextmanager
+def flex_shard_partial_backwards(
+    module: nn.Module, *, run_backward: bool, outer_backward_follows: bool
+) -> Iterator[Callable[[], None]]:
+    """``fsdp_partial_backwards`` for a module with a FlexShard bucket, with
+    the collectives FSDP2 issues for its group. Yields ``before_last_forward``.
+
+    A call of ``module`` on its own leaves its bucket's forward open, so
+    FlexShard runs no post-forward for it and finishes the bucket as soon as
+    the call's input grads are ready: with gradient sync, it reduce-scatters
+    and reshards; without, it keeps the grads, and reshards only with
+    ``reshard_after_backward``. That backward finishes no other bucket, so
+    unlike FSDP2, the other buckets need no changes. Gradient sync is on
+    outside, since ``validate_flex_shard_training`` rejects deferred gradient
+    reduction, so the last call's backward reduce-scatters the grads of all
+    calls, as FSDP2's does.
+
+    Without backward, the bucket's forward stays open, as FSDP2 leaves its
+    group's; ``post_validate_fsdp_for_accelerator_graph`` closes both.
+    """
+    if run_backward and not outer_backward_follows:
+        # Calls whose inputs don't require grad have no trigger that finishes
+        # the bucket. FSDP2 completes each call's grouped forward instead.
+        raise ValueError(
+            "parallelism.fsdp_backend=FlexShardConfig() does not support "
+            "ChunkedLossWrapper with a frozen decoder yet."
+        )
+    bucket = _MODULE_BUCKETS[module]()
+    assert bucket is not None, "FlexShard buckets live as long as their model."
+    reshard_after_backward = bucket.reshard_after_backward
+    # TODO: Gradient sync is set to True, not restored, because FlexShard has
+    # no public getter for it, and validate_flex_shard_training rejects
+    # deferred gradient reduction, so it's always on outside. Allowing deferral
+    # needs the caller's setting restored, and FlexShard's state of grads kept
+    # without sync, to leave the last reduce-scatter to the decoder backward
+    # when earlier microbatches kept grads, as FSDP2 does.
+    try:
+        bucket.set_requires_gradient_sync(False)
+        bucket.set_reshard_after_backward(False)
+        yield lambda: bucket.set_requires_gradient_sync(True)
+    finally:
+        bucket.set_requires_gradient_sync(True)
+        bucket.set_reshard_after_backward(reshard_after_backward)
+        # The last call's backward has resharded the bucket, unless there was
+        # no backward.
+        bucket.reshard()
+
+
+def reshard_flex_shard(model: nn.Module) -> None:
+    """If FlexShard sharded ``model``, reshard all its buckets and close the
+    forwards they left open, with FlexShard's ``reshard()``."""
+    if model in _FLEX_SHARD_MODELS:
+        cast(Any, model).reshard()
+
+
 def validate_flex_shard_training(
     config: "TrainingEngine.Config", model_config: "BaseModel.Config"
 ) -> None:
@@ -121,7 +209,6 @@ def validate_flex_shard_training(
     ``TrainingEngine.__init__`` calls this for every trainer, with the config
     after recipes and overrides.
     """
-    from torchtitan.components.loss import ChunkedLossWrapper
     from torchtitan.components.optim.optimizer import DistMuon
     from torchtitan.distributed.accelerator_graph import accelerator_graphs_supported
     from torchtitan.models.base.module import Module
@@ -155,6 +242,8 @@ def validate_flex_shard_training(
         unsupported.append("parallelism.fsdp_unshard_in_current_stream=True")
     if parallelism.fsdp_defer_gradient_reduction:
         # FlexShard has no equivalent of FSDP2's set_is_last_backward.
+        # TODO: When allowing it, change flex_shard_partial_backwards, which
+        # sets lm_head's bucket's gradient sync to True instead of restoring it.
         unsupported.append("parallelism.fsdp_defer_gradient_reduction=True")
 
     # Decoder._apply_fsdp is the only path that passes fsdp_backend on, so a
@@ -220,8 +309,6 @@ def validate_flex_shard_training(
         unsupported.append(
             "accelerator graphs (set training.disable_accelerator_graphs=True)"
         )
-    if isinstance(config.loss, ChunkedLossWrapper.Config):
-        unsupported.append("ChunkedLossWrapper")
     if config.checkpointer is not None:
         unsupported.append("checkpointing")
     if config.optim.ema is not None:
