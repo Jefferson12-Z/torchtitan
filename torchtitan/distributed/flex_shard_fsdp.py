@@ -12,19 +12,28 @@ each group it would pass to ``fully_shard``, with the same placements, mixed
 precision and reshard policy. The buckets' collectives then match FSDP2's byte
 for byte, so training from the same parameters is bitwise identical.
 
+With expert parallelism, ``fully_shard`` gives an MoE block one group per mesh,
+and the block gets one bucket per group: its routed experts on ``edp_shard``,
+the rest on ``dp_shard``. EP has already split each routed-expert parameter over
+``ep``, and torchtitan declares that split as the parameter's outer layout.
+
 FlexShard parameters and grads are plain local shards, with no DTensor.
 ``apply_fsdp_to_decoder`` wraps each FlexShard parameter's ``param_init``
 function with flex_shard's ``init_from_full``: it fills the full parameter and
 the shard keeps its part, as one device would initialize it, while each of
 FSDP2's DTensor shards draws its own random values. ``flex_shard_grad_norm``
-reduces a bucket's grad norm as DTensor does. One more difference changes only
-memory and communication: FSDP2 skips the embedding's backward all-gather
+reduces a bucket's grad norm as DTensor does. Two more differences change only
+memory and communication. FSDP2 skips the embedding's backward all-gather
 (``set_unshard_in_backward``), which FlexShard can't yet, so it gathers the
-embedding again in backward, with the same values. FlexShard is imported only
-when it is selected.
+embedding again in backward, with the same values. And an MoE block's expert
+bucket hooks the routed experts, not the block, so FlexShard reshards them as
+soon as the routed experts finish forward or backward, while FSDP2 keeps the
+block's expert group unsharded until the whole block finishes. FlexShard is
+imported only when it is selected.
 """
 
 import math
+import weakref
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
@@ -38,8 +47,30 @@ if TYPE_CHECKING:
 
 __all__ = [
     "flex_shard_grad_norm",
+    "record_grad_norm_mesh",
     "validate_flex_shard_training",
 ]
+
+# The mesh to reduce a grad norm over for the parameters of the FlexShard buckets
+# on a mesh, when it isn't that mesh, for flex_shard_grad_norm. Keyed by the
+# mesh the buckets hold, which keeps the entry alive as long as the model.
+_GRAD_NORM_MESHES: weakref.WeakKeyDictionary[
+    DeviceMesh, DeviceMesh
+] = weakref.WeakKeyDictionary()
+
+
+def record_grad_norm_mesh(bucket_mesh: DeviceMesh, mesh: DeviceMesh) -> None:
+    """Record that ``flex_shard_grad_norm`` reduces the grads of the parameters
+    of the FlexShard buckets on ``bucket_mesh`` over the 1D ``mesh``.
+
+    For parameters that an outer sharding split over more ranks before FlexShard
+    sharded each part over ``bucket_mesh``, e.g. routed experts under expert
+    parallelism.
+    """
+    # Meshes compare by value. An equal mesh that an earlier model recorded
+    # would stay the key, and the entry would go when that model does.
+    _GRAD_NORM_MESHES.pop(bucket_mesh, None)
+    _GRAD_NORM_MESHES[bucket_mesh] = mesh
 
 
 def flex_shard_grad_norm(
@@ -52,11 +83,13 @@ def flex_shard_grad_norm(
     """The norm of the grads of FlexShard parameters ``params``, whose buckets
     are on the 1D ``mesh`` (``flex_shard.get_mesh``).
 
-    The grads are plain local shards over ``mesh``. This reduces them in the
-    order ``get_total_norm`` does for DTensor grads sharded over ``mesh``, so the
-    result is bitwise equal: each grad's local norm, reduced over the mesh, then
-    the norm of those norms.
+    The grads are plain local shards over ``mesh``. This reduces them over
+    ``mesh``, or over the 1D mesh ``record_grad_norm_mesh`` recorded for it, in
+    the order ``get_total_norm`` does for DTensor grads sharded over that mesh,
+    so the result is bitwise equal: each grad's local norm, reduced over the
+    mesh, then the norm of those norms.
     """
+    mesh = _GRAD_NORM_MESHES.get(mesh, mesh)
     grads = [p.grad for p in params if p.grad is not None]
     # From flex_shard's examples/deepseek_v3/train.py.
     if foreach is False:
@@ -93,6 +126,8 @@ def validate_flex_shard_training(
     from torchtitan.distributed.accelerator_graph import accelerator_graphs_supported
     from torchtitan.models.base.module import Module
     from torchtitan.models.common.decoder import Decoder
+    from torchtitan.models.common.moe import MoE, RoutedExperts
+    from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
     from torchtitan.quantization.utils import has_quantization
     from torchtitan.trainer import Trainer
 
@@ -106,7 +141,6 @@ def validate_flex_shard_training(
             ),
             ("tensor_parallel_degree", parallelism.tensor_parallel_degree),
             ("context_parallel_degree", parallelism.context_parallel_degree),
-            ("expert_parallel_degree", parallelism.expert_parallel_degree),
             ("pipeline_parallel_degree", parallelism.pipeline_parallel_degree),
         )
         if degree != 1
@@ -156,6 +190,28 @@ def validate_flex_shard_training(
     # quantized all-gather that MXFP8 and NVFP4 weights implement for FSDP2.
     if has_quantization(model_config):
         unsupported.append("MXFP8 and NVFP4 weights")
+    if parallelism.expert_parallel_degree > 1:
+        # Only RoutedExperts with AllToAllTokenDispatcher has been checked
+        # against FSDP2 under EP. FlexShard's expert bucket treats every
+        # routed-expert parameter as split over ep, but output_postprocess
+        # parameters are replicated over ep (models/common/moe/SHARDING.md),
+        # so their grads would never be summed over it.
+        for _, moe, _, _ in model_config.traverse(MoE.Config):
+            routed_experts = moe.routed_experts
+            if type(routed_experts) is not RoutedExperts.Config:
+                feature = type(routed_experts).__qualname__
+            elif (
+                type(routed_experts.token_dispatcher)
+                is not AllToAllTokenDispatcher.Config
+            ):
+                feature = type(routed_experts.token_dispatcher).__qualname__
+            elif routed_experts.output_postprocess is not None:
+                feature = "routed-expert output_postprocess"
+            else:
+                continue
+            entry = f"{feature} with expert parallelism"
+            if entry not in unsupported:
+                unsupported.append(entry)
 
     if (
         not config.training.disable_accelerator_graphs
