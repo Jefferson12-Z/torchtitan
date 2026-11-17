@@ -23,6 +23,7 @@ from torch.distributed.tensor import Shard
 from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import FlexShardConfig, FSDP2Config, FSDPSymmMemScope
 from torchtitan.distributed.flex_shard_fsdp import (
+    declare_state_dict_layouts,
     record_buckets,
     record_grad_norm_mesh,
     reshard_flex_shard,
@@ -489,7 +490,9 @@ def _apply_flex_shard(
     division, as ``disable_fsdp_gradient_division`` makes FSDP2 do. The buckets'
     collectives then match FSDP2's byte for byte. Each sharded parameter's
     ``param_init`` function is wrapped with flex_shard's ``init_from_full``, so
-    the shards start as one device's initialization.
+    the shards start as one device's initialization. ``model.state_dict()``
+    declares each local shard's place in the full parameter, so DCP saves the
+    same checkpoints as for FSDP2.
 
     With expert parallelism, ``edp_mesh`` is the sparse mesh, with the
     ``edp_shard`` and ``ep`` axes. ``fully_shard`` splits an MoE block into one
@@ -656,6 +659,7 @@ def _apply_flex_shard(
             if len(storages_of_module) == 1
         },
     )
+    declare_state_dict_layouts(model)
     if expert_mesh is not None:
         # FlexShard's default prefetches the next bucket in forward order. A
         # block's expert bucket would then gather the next block's dense bucket
