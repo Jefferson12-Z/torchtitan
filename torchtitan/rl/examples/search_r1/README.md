@@ -56,7 +56,8 @@ The recipes keep every rollout worker on the controller's host
 (`rollouter.worker_placement="controller_host_only"`): a worker on another host would send its searches to
 its own `127.0.0.1`, where no retriever runs, and get empty search results. To spread the workers over a
 multi-host job, serve the retriever on an address every host can reach, set `message_env.search_url` to it,
-and set `rollouter.worker_placement="all_hosts"`.
+and set `rollouter.worker_placement="all_hosts"` (see
+[Rollout workers on more than one host](../../README.md#rollout-workers-on-more-than-one-host)).
 
 ### 3. Checkpoint
 Download the base checkpoint the config expects. `download_hf_assets.py` writes to a

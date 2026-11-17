@@ -10,6 +10,7 @@ import asyncio
 import functools
 import itertools
 import logging
+import socket
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -543,9 +544,10 @@ class BaseRolloutWorker(Configurable, ABC):
         for rollout_id, rollout_or_error in enumerate(rollouts_or_errors):
             if isinstance(rollout_or_error, Exception):
                 logger.error(
-                    "rollout group=%d/rollout=%d raised; marking ERROR_INFRA",
+                    "rollout group=%d/rollout=%d raised on host %s; marking ERROR_INFRA",
                     group_id,
                     rollout_id,
+                    socket.gethostname(),
                     exc_info=rollout_or_error,
                 )
                 rollouts.append(
@@ -800,10 +802,11 @@ class MessageEnvRolloutWorker(BaseRolloutWorker):
             # TODO: at shutdown, every rollout still generating lands here with a ~40-line remote
             # traceback. Raise a typed error on generator close and log it at info, without the traceback.
             logger.exception(
-                "rollout %s/rollout=%d failed after %d turn(s); marking ERROR_INFRA",
+                "rollout %s/rollout=%d failed after %d turn(s) on host %s; marking ERROR_INFRA",
                 group_id,
                 rollout_id,
                 len(turns),
+                socket.gethostname(),
             )
             status = RolloutStatus.ERROR_INFRA
             logs["error"] = repr(error)

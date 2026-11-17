@@ -221,9 +221,11 @@ def test_muse_glimmer_renderer_survives_verifiers_worker_config() -> None:
 def test_setup_async_builds_the_train_client_and_bypasses_the_proxy(
     monkeypatch,
 ) -> None:
+    import verifiers.v1 as vf
     from renderers import CustomRendererConfig
     from torchtitan.components.renderer import from_renderers
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
+    from verifiers.v1.tasksets.harbor import HarborConfig
 
     # `setup_async` edits both proxy variables; monkeypatch restores them after the test.
     monkeypatch.setenv("no_proxy", ".corp.internal")
@@ -240,7 +242,15 @@ def test_setup_async_builds_the_train_client_and_bypasses_the_proxy(
     worker._generation_server = SimpleNamespace(
         start=AsyncMock(), base_url="http://127.0.0.1:2/v1"
     )
-    worker._verifiers_env = SimpleNamespace(serving=serving_env)
+    worker._verifiers_env = SimpleNamespace(
+        serving=serving_env,
+        # The default runtime is not Docker, so setup runs no `docker version`.
+        config=vf.SingleAgentEnvConfig(
+            taskset=HarborConfig(
+                id="harbor", dataset="terminal-bench/terminal-bench-2-1"
+            )
+        ),
+    )
     worker._serving = contextlib.AsyncExitStack()
     renderers_config = CustomRendererConfig(
         import_path="torchtitan.models.muse_glimmer.renderer.MuseGlimmerRenderer",

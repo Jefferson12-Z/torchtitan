@@ -259,6 +259,44 @@ python -m torchtitan.rl.train \
 
 See [Launchers](./actors/monarch/README.md#launchers).
 
+## Rollout workers on more than one host
+
+By default, rollout workers spread over every host of the job: `rollouter.worker_placement` is
+`"all_hosts"` (see `RolloutWorkerPlacement` in `torchtitan/rl/rollout/rollouter.py`). Each worker
+runs its env on its own host, so whatever a worker reads must be reachable from every host:
+
+| A worker reads | Make it reachable | Examples |
+| --- | --- | --- |
+| Files, by path | Put them in a shared folder: a filesystem mounted at the same path on every host, e.g. a home directory shared over NFS. As a last fallback, copy them to that path on each host. Nothing checks that the copies match. | the model's tokenizer (`hf_assets_path`), Geometry3K and SLAKE images, Terminal-Bench's Harbor cache |
+| A service at 127.0.0.1 | Serve it on an address every host can reach, or keep the workers on the controller's host (`rollouter.worker_placement="controller_host_only"`). A worker that can't reach Search-R1's retriever gets empty search results. It logs a warning, and the rollout still trains. | Search-R1's retriever |
+| A local sandbox runtime | Run it on every host, e.g. a Docker daemon, or keep the workers on the controller's host. A Verifiers worker whose agents run in Docker fails the job at start on a host without it. | Terminal-Bench |
+
+A relative path resolves from each worker's working directory. `SlurmLauncher` runs each node's
+processes from the submit directory, so that directory must resolve to the same files on every node
+(see [Launchers](./actors/monarch/README.md#launchers)).
+
+When a file is missing on a worker's host:
+
+- An image file: the rollout ends `ERROR_INFRA` and is not trained. The log names the host (example
+  below).
+- The tokenizer (`hf_assets_path`): a `MessageEnv` worker's setup fails, so the job fails at start.
+- A Terminal-Bench task's `tests/`: the group fails and is not trained. The error names the path and
+  the host.
+
+Example, a SLAKE image:
+
+```text
+rollout 12/rollout=3 failed after 0 turn(s) on host gpu-7; marking ERROR_INFRA
+Traceback (most recent call last):
+  ...
+FileNotFoundError: [Errno 2] No such file or directory: '/data/slake/imgs/xmlab1/source.jpg'
+```
+
+A host that misses an image file or a task's `tests/` ends each group it gets right away, with nothing
+to train. Its workers then have the fewest rollouts in flight. The rollouter sends each new group to the
+worker with the fewest, so that host gets most new groups, and the run makes little progress (see the
+TODO "retire a worker whose groups keep failing" in `Rollouter.run_group_rollouts`).
+
 ## Trainer/generator consistency
 
 Install the batch-invariant kernels shown in [Prerequisites](#prerequisites), then follow the [bitwise parity guide](./BITWISE_PARITY.md) for configuration, supported layouts, verification, and limitations.
