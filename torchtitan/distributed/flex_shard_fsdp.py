@@ -16,6 +16,10 @@ With expert parallelism, ``fully_shard`` gives an MoE block one group per mesh,
 and the block gets one bucket per group: its routed experts on ``edp_shard``,
 the rest on ``dp_shard``. EP has already split each routed-expert parameter over
 ``ep``, and torchtitan declares that split as the parameter's outer layout.
+Likewise under tensor parallelism, each parameter is its tp rank's shard, and
+declares TP's split as its outer layout, or tp as the group its grad is partial
+over. Under context parallelism, the buckets shard over ``dp_shard`` and ``cp``
+flattened into one axis, as ``fully_shard`` does.
 
 FlexShard parameters and grads are plain local shards, with no DTensor.
 ``apply_fsdp_to_decoder`` wraps each FlexShard parameter's ``param_init``
@@ -73,7 +77,7 @@ __all__ = [
     "validate_flex_shard_training",
 ]
 
-# The mesh to reduce a grad norm over for the parameters of the FlexShard buckets
+# The mesh FSDP2 lays out the grads of the parameters of the FlexShard buckets
 # on a mesh, when it isn't that mesh, for flex_shard_grad_norm. Keyed by the
 # mesh the buckets hold, which keeps the entry alive as long as the model.
 _GRAD_NORM_MESHES: weakref.WeakKeyDictionary[
@@ -93,11 +97,13 @@ _MODULE_BUCKETS: weakref.WeakKeyDictionary[
 
 def record_grad_norm_mesh(bucket_mesh: DeviceMesh, mesh: DeviceMesh) -> None:
     """Record that ``flex_shard_grad_norm`` reduces the grads of the parameters
-    of the FlexShard buckets on ``bucket_mesh`` over the 1D ``mesh``.
+    of the FlexShard buckets on ``bucket_mesh`` over ``mesh``.
 
-    For parameters that an outer sharding split over more ranks before FlexShard
-    sharded each part over ``bucket_mesh``, e.g. routed experts under expert
-    parallelism.
+    For parameters that an outer sharding, tensor or expert parallelism, split
+    over more ranks before FlexShard sharded each part over ``bucket_mesh``.
+    ``mesh`` is the mesh of FSDP2's DTensor grads for them, with
+    ``bucket_mesh``'s ranks as its first dim, or that mesh flattened if their
+    DTensor norm reduces over it in one all-reduce.
     """
     # Meshes compare by value. An equal mesh that an earlier model recorded
     # would stay the key, and the entry would go when that model does.
@@ -115,25 +121,46 @@ def flex_shard_grad_norm(
     """The norm of the grads of FlexShard parameters ``params``, whose buckets
     are on the 1D ``mesh`` (``flex_shard.get_mesh``).
 
-    The grads are plain local shards over ``mesh``. This reduces them over
-    ``mesh``, or over the 1D mesh ``record_grad_norm_mesh`` recorded for it, in
-    the order ``get_total_norm`` does for DTensor grads sharded over that mesh,
-    so the result is bitwise equal: each grad's local norm, reduced over the
-    mesh, then the norm of those norms.
+    The grads are plain local shards over ``mesh``, or over the mesh
+    ``record_grad_norm_mesh`` recorded for it, whose first dim is ``mesh``'s
+    ranks. Like FSDP2's DTensor grads, each is sharded over that mesh's first
+    dim, and over the others if ``is_outer_sharded``. This computes the norm as
+    ``get_total_norm`` does for DTensor grads with that layout, so the result is
+    bitwise equal. Each grad's local norm is partial over the dims that shard
+    it. Stacking the norms makes them partial over every dim that shards any
+    grad: a norm replicated on such a dim is divided by the dim's size
+    ** (1 / p), so that its copies sum to it. The stacked norms are reduced over
+    each dim in turn, and their norm is taken last. Taking it before the
+    reduction isn't bitwise equal.
     """
     mesh = _GRAD_NORM_MESHES.get(mesh, mesh)
     grads = [p.grad for p in params if p.grad is not None]
+    replicated = [not is_outer_sharded(p) for p in params if p.grad is not None]
     # From flex_shard's examples/deepseek_v3/train.py.
     if foreach is False:
-        norms = torch.stack([torch.linalg.vector_norm(g, norm_type) for g in grads])
+        norm_list = [torch.linalg.vector_norm(g, norm_type) for g in grads]
     else:
-        norms = torch.stack(torch._foreach_norm(grads, norm_type))
-    if math.isinf(norm_type):
-        dist.all_reduce(norms, op=dist.ReduceOp.MAX, group=mesh.get_group())
-    else:
-        norms **= norm_type
-        dist.all_reduce(norms, group=mesh.get_group())
-        norms **= 1.0 / norm_type
+        norm_list = list(torch._foreach_norm(grads, norm_type))
+    # The dims that shard some grad, over which the stacked norms are partial.
+    dims = range(1 if all(replicated) else mesh.ndim)
+    for dim in dims[1:]:
+        # Each norm on its own, so that no mask has to be copied to the device.
+        scale = math.pow(mesh.size(dim), 1.0 / norm_type)
+        norm_list = [
+            norm / scale if is_replicated else norm
+            for norm, is_replicated in zip(norm_list, replicated, strict=True)
+        ]
+    norms = torch.stack(norm_list)
+    for dim in dims:
+        # DTensor skips dims of size 1.
+        if mesh.size(dim) == 1:
+            continue
+        if math.isinf(norm_type):
+            dist.all_reduce(norms, op=dist.ReduceOp.MAX, group=mesh.get_group(dim))
+        else:
+            norms **= norm_type
+            dist.all_reduce(norms, group=mesh.get_group(dim))
+            norms **= 1.0 / norm_type
     total_norm = torch.linalg.vector_norm(norms, norm_type)
     if error_if_nonfinite and not torch.isfinite(total_norm):
         raise RuntimeError(
@@ -143,6 +170,18 @@ def flex_shard_grad_norm(
             "`error_if_nonfinite=False`"
         )
     return total_norm
+
+
+def is_outer_sharded(param: torch.Tensor) -> bool:
+    """Whether FlexShard parameter ``param`` is a shard of an outer sharding,
+    tensor or expert parallelism, which declared its layout before
+    ``flex_shard()``. Else its grad is the same on the ranks of each dim of the
+    mesh ``flex_shard_grad_norm`` reduces it over but the first, e.g. a norm
+    weight's under TP."""
+    # pyrefly: ignore [missing-import]
+    from flex_shard import get_outer_layout
+
+    return get_outer_layout(param) is not None
 
 
 def record_buckets(model: nn.Module, module_buckets: dict[nn.Module, Any]) -> None:
@@ -482,8 +521,6 @@ def validate_flex_shard_training(
                 "data_parallel_replicate_degree",
                 parallelism.data_parallel_replicate_degree,
             ),
-            ("tensor_parallel_degree", parallelism.tensor_parallel_degree),
-            ("context_parallel_degree", parallelism.context_parallel_degree),
             ("pipeline_parallel_degree", parallelism.pipeline_parallel_degree),
         )
         if degree != 1
